@@ -1,0 +1,58 @@
+Helin Assistant Proprietary License
+Version 1.0 — 2026-10-19
+
+Copyright (c) 2026 ObsidianSync. All rights reserved except as expressly
+permitted below.
+
+1. Scope and ownership
+
+This license applies to the first-party code, official compiled plugin and
+associated documentation of Helin Assistant (the "Software"). The copyright
+holder retains ownership. The Software is proprietary; this is not an
+open-source license. Service infrastructure, user notes and separately licensed
+third-party components are not licensed as first-party Software by this notice.
+
+2. Permission to download, install and use
+
+The copyright holder grants you a limited, non-exclusive license to download
+official releases, install and run unmodified copies on your own devices, and
+keep copies for backup and installation on those devices, in conjunction with
+service accounts and Vault access that you are authorized to use. No service
+account, access to another user's data, or guarantee of continued service
+availability is granted by this license.
+
+3. Official distribution and review
+
+The copyright holder authorizes the official GitHub distribution repository,
+Obsidian's community directory and BRAT installation/update mechanisms to host,
+cache and deliver unmodified official release files for the permitted uses,
+with the applicable copyright and license notices retained. Obsidian's
+authorized reviewers and automated review systems may inspect and build plugin
+source supplied to them by the copyright holder for submission review and build
+verification. Access for review does not authorize public redistribution of
+private source.
+
+4. Reserved rights
+
+Except for the permissions above, a separate written permission from the
+copyright holder, or rights that applicable law does not permit to be excluded,
+you may not modify, sublicense, sell, or redistribute first-party Software or
+its source code. Keep this license and applicable copyright notices with copies
+made under this license. No trademark rights are granted.
+
+5. Third-party components
+
+Third-party components retain their own copyrights and licenses, reproduced in
+THIRD_PARTY_NOTICES.txt and in the compiled main.js. The restrictions in this
+license apply only to first-party Software and do not replace or restrict the
+permissions granted by those third-party licenses. In case of a conflict about
+a third-party component, that component's own license governs that component.
+
+6. Warranty and liability
+
+TO THE EXTENT PERMITTED BY APPLICABLE LAW, THE SOFTWARE IS PROVIDED "AS IS",
+WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING WARRANTIES OF
+MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NON-INFRINGEMENT.
+TO THE SAME EXTENT, THE COPYRIGHT HOLDER IS NOT LIABLE FOR CLAIMS OR DAMAGES
+ARISING FROM THE SOFTWARE OR ITS USE. THIS CLAUSE DOES NOT EXCLUDE RIGHTS OR
+LIABILITIES THAT APPLICABLE LAW DOES NOT ALLOW TO BE EXCLUDED.

@@ -1,0 +1,7 @@
+Copyright (c) 2026 ObsidianSync. All rights reserved.
+
+This distribution is provided for installation and use with authorized service access.
+The first-party permissions and restrictions are stated in LICENSE.
+No open-source license for first-party code is granted by this release.
+Third-party components retain their own copyrights and licenses, reproduced in
+THIRD_PARTY_NOTICES.txt and in main.js.
