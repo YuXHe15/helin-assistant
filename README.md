@@ -1,4 +1,4 @@
-# Helin Assistant 0.4.10
+# Helin Assistant 0.4.11
 
 在 Obsidian 原文旁阅读短摘要，在后台连接已有知识、补充必要的知识页，并查看或安全撤销自动修改。支持简繁显示和摘要内公式、代码排版。
 
@@ -19,6 +19,12 @@ Read concise AI summaries beside your Obsidian notes. Connect related knowledge 
 
 Background automation produces whole-note and section summaries without changing the source file. Knowledge maintenance reuses existing pages first, creates new pages only when justified by the source, and adds contextual wiki links. It is opt-in and can write in the configured scope automatically. Review every batch and use version-checked undo; edited or referenced knowledge pages may be retained. Simplified/Traditional conversion changes rendering only. Formula and code rendering never executes notebook code or third-party Markdown processors.
 
+## 配对与会话 / Pairing and sessions
+
+服务支持时，新版会保留设备、用户、Vault、本机绑定和服务地址，自动将已有配对升级为轮换会话，无需先退出。访问凭证有效15分钟并自动刷新；刷新凭证每次使用后轮换，闲置30天过期，会话最迟90天后需重新配对。设置中可查看到期信息。后台摘要使用同一刷新机制；断网或安全存储写入暂时失败可重试，退出会立即清除本机显示数据并尝试撤销服务端连接。无法联网时，可稍后通过门户撤销该设备。
+
+When supported by the service, this version upgrades an existing pairing in place. Access credentials last 15 minutes and refresh automatically. Refresh credentials rotate after use, expire after 30 idle days, and have a fixed 90-day session deadline. The existing user, Vault, device and service origin are preserved. Recovery handles interrupted responses and storage failures; logout clears local state and attempts server revocation. An offline device can also be revoked through the portal.
+
 ## 从旧试用版迁移 / Migration from earlier trials
 
 本发行的标识是 `helin-assistant`，安装仓库是 `YuXHe15/helin-assistant`。此前本项目的私有试用版 **Vault Assistant** 来自 `YuXHe15/obsidian-vault-assistant`，使用旧标识 `vault-assistant`；临时品牌 **Heyux Assistant 0.4.6** 来自 `YuXHe15/heyux-assistant`，使用标识 `heyux-assistant`。
@@ -37,11 +43,11 @@ Minimum Obsidian version: **1.11.4**. **iPadOS is a mobile release target; physi
 
 社区目录是否已收录、哪个版本可安装，以 [Obsidian 社区目录](https://community.obsidian.md/plugins) 实际显示为准。本说明与本地构建不代表审核已经通过。
 
-Before installing version **0.4.10**, verify that its matching [GitHub release](https://github.com/YuXHe15/helin-assistant/releases) exists. These instructions do not claim that this version has already been published or accepted into the community directory.
+Before installing version **0.4.11**, verify that its matching [GitHub release](https://github.com/YuXHe15/helin-assistant/releases) exists. These instructions do not claim that this version has already been published or accepted into the community directory.
 
 - **社区目录 / Community directory**：收录后，在 Obsidian 的第三方插件浏览中搜索 **Helin Assistant**，安装并启用。
 - **试用 / BRAT**：安装 [BRAT](https://github.com/TfTHacker/obsidian42-brat)，添加 `YuXHe15/helin-assistant`，选择已发布的目标版本，再启用 Helin Assistant。普通安装不需要 GitHub 令牌。
-- **桌面手动安装 / Desktop manual installation**：下载同版本 `helin-assistant-0.4.10.zip`，将其中的 `helin-assistant` 文件夹放到 Vault 的 `.obsidian/plugins/`。更新时替换发布文件，保留已有本机配置与配对。
+- **桌面手动安装 / Desktop manual installation**：下载同版本 `helin-assistant-0.4.11.zip`，将其中的 `helin-assistant` 文件夹放到 Vault 的 `.obsidian/plugins/`。更新时替换发布文件，保留已有本机配置与配对。
 
 安装目录内的运行文件是 `manifest.json`、`main.js` 和 `styles.css`。保留随包附带的 `LICENSE`、`COPYRIGHT.txt` 和 `THIRD_PARTY_NOTICES.txt`；许可证也附在 `main.js` 中，覆盖只下载运行文件的安装方式。不要复制他人的 `data.json` 或秘密存储。
 

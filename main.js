@@ -638,6 +638,12 @@ function sessionMetadata(value, now, requirePolicy = false) {
   if (policy.mode === "sliding" && Number.isInteger(policy.idle_days) && policy.idle_days > 0 && policy.idle_days <= 3650 && Number.isInteger(policy.renew_before_days) && policy.renew_before_days >= 0 && policy.renew_before_days < policy.idle_days && typeof data.renew_after === "string" && Number.isFinite(Date.parse(data.renew_after)) && Date.parse(data.renew_after) <= Date.parse(data.expires_at)) {
     result.session_policy = { mode: "sliding", idle_days: policy.idle_days, renew_before_days: policy.renew_before_days };
     result.renew_after = data.renew_after;
+  } else if (policy.mode === "rotating" && data.session_protocol === "rotating-v1" && Number.isInteger(policy.idle_days) && policy.idle_days > 0 && policy.idle_days <= 90 && Number.isInteger(policy.max_days) && policy.max_days >= policy.idle_days && policy.max_days <= 365 && Number.isInteger(policy.access_minutes) && policy.access_minutes > 0 && policy.access_minutes <= 60 && validExpiry(data.absolute_expires_at, now) && Date.parse(data.expires_at) <= Date.parse(data.absolute_expires_at) && typeof data.access_expires_at === "string" && Number.isFinite(Date.parse(data.access_expires_at)) && Date.parse(data.access_expires_at) <= Date.parse(data.expires_at) && typeof data.renew_after === "string" && Number.isFinite(Date.parse(data.renew_after)) && Date.parse(data.renew_after) <= Date.parse(data.access_expires_at)) {
+    result.session_policy = { mode: "rotating", idle_days: policy.idle_days, max_days: policy.max_days, access_minutes: policy.access_minutes };
+    result.session_protocol = "rotating-v1";
+    result.absolute_expires_at = data.absolute_expires_at;
+    result.access_expires_at = data.access_expires_at;
+    result.renew_after = data.renew_after;
   } else if (requirePolicy) throw new ApiError(500);
   return result;
 }
@@ -733,6 +739,7 @@ var AssistantController = class {
     this.state = emptyState();
     this.config = cleanConfig(null);
     this.credential = null;
+    this.durableToken = null;
     this.epoch = 0;
     this.selection = 0;
     this.pollEpoch = 0;
@@ -990,7 +997,9 @@ var AssistantController = class {
   async saveSession(session, epoch, preserveNewer = false) {
     const old = this.credential, ref = this.config.secret_ref;
     if (!old || !ref || !this.current(epoch)) return;
+    if (old.session_protocol === "rotating-v1" && session.session_protocol !== "rotating-v1") return;
     if (preserveNewer && old.session_policy && Date.parse(session.expires_at) < Date.parse(old.expires_at)) return;
+    if (preserveNewer && old.session_protocol === "rotating-v1" && old.access_expires_at && session.access_expires_at && Date.parse(session.access_expires_at) < Date.parse(old.access_expires_at)) return;
     const next = { ...old, ...session };
     if (!session.session_policy) {
       delete next.session_policy;
@@ -1001,22 +1010,88 @@ var AssistantController = class {
     const write = this.secretPersistence.catch(() => void 0).then(async () => {
       if (!this.current(epoch) || this.config.secret_ref !== ref || this.credential !== next) return;
       await this.adapters.setSecret(ref, JSON.stringify(next));
+      if (this.current(epoch) && this.config.secret_ref === ref) this.durableToken = next.token;
     });
     this.secretPersistence = write;
     await write;
   }
-  async renewIfDue(epoch) {
+  async persistCredential(next, epoch) {
+    const old = this.credential, ref = this.config.secret_ref;
+    if (!old || !ref || !this.current(epoch)) return;
+    this.credential = next;
+    const write = this.secretPersistence.catch(() => void 0).then(async () => {
+      if (this.current(epoch) && this.config.secret_ref === ref) {
+        await this.adapters.setSecret(ref, JSON.stringify(next));
+        if (this.current(epoch) && this.config.secret_ref === ref) this.durableToken = next.token;
+      }
+    });
+    this.secretPersistence = write;
+    try {
+      await write;
+    } catch {
+      if (this.current(epoch) && this.credential === next) this.credential = old;
+      throw new ApiError(0, "storage");
+    }
+  }
+  async awaitDurableCredential(epoch) {
+    const ref = this.config.secret_ref, origin = this.getServiceAddress();
+    while (this.current(epoch)) {
+      const renewal = this.renewal?.epoch === epoch ? this.renewal.promise : null;
+      if (renewal) await renewal;
+      const persistence = this.secretPersistence;
+      await persistence.catch(() => void 0);
+      if (!this.current(epoch) || this.config.secret_ref !== ref || this.getServiceAddress() !== origin) throw new ApiError(0, "stale");
+      if (this.secretPersistence !== persistence || this.renewal?.epoch === epoch && this.renewal.promise !== renewal) continue;
+      if (!this.credential || this.credential.pending_session || this.credential.token !== this.durableToken) throw new ApiError(0, "storage");
+      return;
+    }
+    throw new ApiError(0, "stale");
+  }
+  rotationResult(value) {
+    const result = record(value), credential = this.credential;
+    if (!credential || result.device_id !== credential.device_id || stringId(result.user_id) !== credential.user_id || result.vault_id !== credential.vault_id || typeof result.token !== "string" || !new RegExp(`^oaa_${credential.device_id}\\.[a-f0-9]{64}$`).test(result.token) || typeof result.refresh_token !== "string" || !new RegExp(`^oar_${credential.device_id}\\.[a-f0-9]{64}$`).test(result.refresh_token)) throw new ApiError(500);
+    const metadata = sessionMetadata(result, this.now(), true);
+    if (metadata.session_protocol !== "rotating-v1") throw new ApiError(500);
+    return { token: result.token, refresh_token: result.refresh_token, ...metadata };
+  }
+  async rotateCredential(epoch, kind) {
+    let credential = this.credential;
+    if (!credential || !this.current(epoch)) return;
+    if (!credential.pending_session) {
+      const request_id = this.adapters.randomHex(16);
+      if (!validId(request_id)) throw new ApiError(500);
+      await this.persistCredential({ ...credential, pending_session: { kind, request_id } }, epoch);
+      credential = this.credential;
+    }
+    if (!credential || !this.current(epoch)) return;
+    const pending = credential.pending_session;
+    if (!pending || pending.kind !== kind) throw new ApiError(500);
+    const response = kind === "upgrade" ? await this.request("/session/upgrade", "POST", { request_id: pending.request_id }, true, false) : await this.request("/session/refresh", "POST", { request_id: pending.request_id, refresh_token: credential.refresh_token }, false, false);
+    if (!this.current(epoch) || !this.credential) return;
+    const next = { ...this.credential, ...this.rotationResult(response.json) };
+    delete next.pending_session;
+    await this.persistCredential(next, epoch);
+  }
+  async renewIfDue(epoch, upgrade = false, force = false) {
     const credential = this.credential, now = this.now();
-    if (!this.current(epoch) || !credential?.session_policy || !credential.renew_after || now < Date.parse(credential.renew_after) || now < this.renewRetryAt) return;
+    if (!this.current(epoch) || !credential) return;
+    const rotating = credential.session_protocol === "rotating-v1";
+    const migrating = !rotating && (upgrade || credential.pending_session?.kind === "upgrade");
+    if (!migrating && !credential.pending_session && !(rotating && force) && (!credential.session_policy || !credential.renew_after || now < Date.parse(credential.renew_after) || now < this.renewRetryAt)) return;
     if (this.renewal?.epoch === epoch) {
       await this.renewal.promise;
       return;
     }
     const promise = (async () => {
       try {
-        const response = await this.request("/session/renew", "POST", {}, true, false);
-        if (!this.current(epoch)) return;
-        await this.saveSession(sessionMetadata(response.json, this.now(), true), epoch);
+        if (migrating || rotating) {
+          await this.rotateCredential(epoch, migrating ? "upgrade" : "refresh");
+          if (this.current(epoch) && this.credential?.access_expires_at && Date.parse(this.credential.access_expires_at) <= this.now()) await this.rotateCredential(epoch, "refresh");
+        } else {
+          const response = await this.request("/session/renew", "POST", {}, true, false);
+          if (!this.current(epoch)) return;
+          await this.saveSession(sessionMetadata(response.json, this.now(), true), epoch);
+        }
         if (!this.current(epoch) || !this.credential) return;
         this.renewRetryAt = 0;
         if (this.state.account) {
@@ -1025,6 +1100,7 @@ var AssistantController = class {
         }
       } catch (error2) {
         if (authError(error2)) throw error2;
+        if (migrating || rotating) throw error2;
         if (this.current(epoch)) this.renewRetryAt = this.now() + 6e4;
       }
     })();
@@ -1036,31 +1112,36 @@ var AssistantController = class {
     }
   }
   async accountFromServer(epoch) {
+    if (this.credential?.session_protocol === "rotating-v1" || this.credential?.pending_session) await this.renewIfDue(epoch);
+    if (!this.current(epoch)) return null;
     const previous = this.credential;
     const response = await this.request("/me", "GET", void 0, true, false), account = response.json;
     if (!this.current(epoch)) return null;
     this.assertAccount(account);
     if (!account.assistant_enabled) throw new ApiError(403);
     if (account.read_only !== void 0 && typeof account.read_only !== "boolean") throw new ApiError(500);
-    await this.saveSession(sessionMetadata(account, this.now()), epoch, previous !== this.credential);
+    await this.saveSession(sessionMetadata(account, this.now(), this.credential?.session_protocol === "rotating-v1"), epoch, previous !== this.credential);
     if (!this.current(epoch)) return null;
-    await this.renewIfDue(epoch);
+    await this.renewIfDue(epoch, Array.isArray(account.session_protocols) && account.session_protocols.includes("rotating-v1"));
     if (!this.current(epoch) || !this.credential) return null;
     const result = { ...account };
     delete result.session_policy;
     delete result.renew_after;
     return { ...result, read_only: account.read_only ?? false, ...sessionMetadata(this.credential, this.now()) };
   }
-  async request(path, method = "GET", body, auth = true, renew = true, query) {
+  async request(path, method = "GET", body, auth = true, renew = true, query, retryAuth = true) {
     if (!path.startsWith("/") || path.includes("..") || /[?#]/.test(path)) throw new ApiError(400);
     const epoch = this.epoch;
     if (auth && renew && path !== "/session/revoke") await this.renewIfDue(epoch);
+    const durableAuth = auth && !["/session/upgrade", "/session/renew", "/session/revoke"].includes(path);
+    if (durableAuth) await this.awaitDurableCredential(epoch);
     const headers = { Accept: "application/json" };
     const baseUrl = this.getServiceBaseUrl(), origin = this.getServiceAddress();
     if (!baseUrl || !origin || !this.current(epoch)) throw new ApiError(400, "service");
     if (body !== void 0) headers["Content-Type"] = "application/json";
     if (auth) {
       if (!this.credential || this.credential.service_origin !== origin || !this.current(epoch)) throw new ApiError(401);
+      if (durableAuth && (this.credential.pending_session || this.credential.token !== this.durableToken)) throw new ApiError(0, "storage");
       headers.Authorization = `Bearer ${this.credential.token}`;
     }
     let response;
@@ -1077,6 +1158,15 @@ var AssistantController = class {
     } finally {
       if (timer !== void 0) clearTimeout(timer);
     }
+    if (response.status === 401 && auth && this.current(epoch) && this.credential && headers.Authorization !== `Bearer ${this.credential.token}`) {
+      if (retryAuth && method === "GET") return this.request(path, method, body, auth, false, query, false);
+      throw new ApiError(0, "retired-access");
+    }
+    if (response.status === 401 && auth && retryAuth && this.current(epoch) && this.credential?.session_protocol === "rotating-v1") {
+      await this.renewIfDue(epoch, false, true);
+      if (method === "GET") return this.request(path, method, body, auth, false, query, false);
+      throw new ApiError(0, "access-renewed");
+    }
     if (response.status < 200 || response.status >= 300) throw new ApiError(response.status);
     return response;
   }
@@ -1087,7 +1177,14 @@ var AssistantController = class {
     const epoch = this.epoch, scope = this.sessionKey();
     if (!scope || this.state.phase !== "ready") throw new ApiError(401);
     try {
-      const response = await this.request(`/automation${path}`, method, body, true, !background, query);
+      const response = await this.request(
+        `/automation${path}`,
+        method,
+        body,
+        true,
+        !background || this.credential?.session_protocol === "rotating-v1" || !!this.credential?.pending_session,
+        query
+      );
       if (!this.current(epoch) || scope !== this.sessionKey()) throw new ApiError(409, "stale");
       this.assertScope(response.json);
       const result = record(response.json);
@@ -1132,6 +1229,7 @@ var AssistantController = class {
     this.dagRevisions.clear();
     this.dagSubmissions.clear();
     this.credential = null;
+    this.durableToken = null;
     this.state = emptyState();
     this.config = cleanConfig({ base_url: service });
     this.legacyTabs = false;
@@ -1164,6 +1262,7 @@ var AssistantController = class {
     this.dagRevisions.clear();
     this.dagSubmissions.clear();
     this.credential = null;
+    this.durableToken = null;
     this.state = emptyState();
     this.state.busy = true;
     this.emit();
@@ -1183,7 +1282,7 @@ var AssistantController = class {
         parsed = record(JSON.parse(raw || "{}"));
       } catch {
       }
-      if (parsed.local_binding_id !== this.adapters.localBindingId || parsed.vault_id !== this.config.vault_id || !validId(parsed.vault_id) || !validId(parsed.device_id) || !stringId(parsed.user_id) || typeof parsed.token !== "string" || parsed.token.length < 16 || /[\r\n]/.test(parsed.token) || typeof parsed.expires_at !== "string" || !Number.isFinite(Date.parse(parsed.expires_at)) || parsed.service_origin !== void 0 && parsed.service_origin !== this.getServiceAddress()) {
+      if (parsed.local_binding_id !== this.adapters.localBindingId || parsed.vault_id !== this.config.vault_id || !validId(parsed.vault_id) || !validId(parsed.device_id) || !stringId(parsed.user_id) || typeof parsed.token !== "string" || parsed.token.length < 16 || /[\r\n]/.test(parsed.token) || typeof parsed.expires_at !== "string" || !Number.isFinite(Date.parse(parsed.expires_at)) || parsed.session_protocol !== void 0 && parsed.session_protocol !== "rotating-v1" || parsed.session_protocol === "rotating-v1" && (parsed.session_policy?.mode !== "rotating" || typeof parsed.renew_after !== "string" || !Number.isFinite(Date.parse(parsed.renew_after)) || typeof parsed.refresh_token !== "string" || !new RegExp(`^oar_${parsed.device_id}\\.[a-f0-9]{64}$`).test(parsed.refresh_token)) || parsed.pending_session !== void 0 && (!validId(parsed.pending_session?.request_id) || !["upgrade", "refresh"].includes(parsed.pending_session?.kind) || parsed.pending_session.kind === "refresh" !== (parsed.session_protocol === "rotating-v1")) || parsed.service_origin !== void 0 && parsed.service_origin !== this.getServiceAddress()) {
         this.config = cleanConfig({ base_url: this.config.base_url });
         await this.saveConfig(this.config, epoch);
         if (!this.current(epoch)) return;
@@ -1205,6 +1304,7 @@ var AssistantController = class {
       }
       this.legacyTabs = parsed.legacy_tabs === true;
       this.credential = parsed;
+      this.durableToken = this.credential.token;
       await this.loadAccount(epoch);
     } catch (error2) {
       await this.fail(error2, epoch);
@@ -1261,11 +1361,18 @@ var AssistantController = class {
       while (this.current(epoch) && poll === this.pollEpoch && validExpiry(pair.expires_at, this.now())) {
         await this.delay(interval);
         if (!this.current(epoch) || poll !== this.pollEpoch) return;
-        const response = await this.request(`/pairings/${pair.pair_id}/exchange`, "POST", { poll_secret: secret }, false);
+        const rotating = Array.isArray(pair.session_protocols) && pair.session_protocols.includes("rotating-v1");
+        const response = await this.request(
+          `/pairings/${pair.pair_id}/exchange`,
+          "POST",
+          { poll_secret: secret, ...rotating ? { session_protocol: "rotating-v1" } : {} },
+          false
+        );
         if (!this.current(epoch) || poll !== this.pollEpoch) return;
         if (response.status === 202) continue;
         const result = response.json;
         if (!result.user || !result.vault || !validId(result.vault.id) || !validId(result.device_id) || !stringId(result.user.id) || typeof result.token !== "string" || result.token.length < 16 || /[\r\n]/.test(result.token) || !validExpiry(result.expires_at, this.now())) throw new ApiError(500);
+        if (rotating && (result.session_protocol !== "rotating-v1" || typeof result.refresh_token !== "string" || !new RegExp(`^oar_${result.device_id}\\.[a-f0-9]{64}$`).test(result.refresh_token) || !new RegExp(`^oaa_${result.device_id}\\.[a-f0-9]{64}$`).test(result.token))) throw new ApiError(500);
         const ref = `vault-assistant-${this.adapters.randomHex(16)}`;
         if (!SECRET_REF.test(ref)) throw new ApiError(500);
         const credential = {
@@ -1275,7 +1382,8 @@ var AssistantController = class {
           device_id: result.device_id,
           local_binding_id: this.adapters.localBindingId,
           service_origin: this.getServiceAddress(),
-          ...sessionMetadata(result, this.now())
+          ...rotating ? { refresh_token: result.refresh_token } : {},
+          ...sessionMetadata(result, this.now(), rotating)
         };
         await this.adapters.setSecret(ref, JSON.stringify(credential));
         if (!this.current(epoch) || poll !== this.pollEpoch) {
@@ -1284,6 +1392,7 @@ var AssistantController = class {
         }
         this.config = { base_url: this.config.base_url, vault_id: credential.vault_id, secret_ref: ref };
         this.credential = credential;
+        this.durableToken = credential.token;
         await this.saveConfig(this.config, epoch);
         if (!this.current(epoch)) return;
         await this.loadAccount(epoch);
@@ -1296,7 +1405,14 @@ var AssistantController = class {
   }
   async logout() {
     const credential = this.credential;
-    const revocation = credential ? this.request("/session/revoke", "POST", {}).catch(() => void 0) : Promise.resolve();
+    const recovery = credential?.pending_session;
+    const useProof = credential?.session_protocol === "rotating-v1" || recovery?.kind === "upgrade";
+    const revocation = credential ? (useProof ? this.request("/session/revoke-proof", "POST", {
+      proof: credential.refresh_token ?? credential.token,
+      user_id: credential.user_id,
+      vault_id: credential.vault_id,
+      ...recovery ? { request_id: recovery.request_id } : {}
+    }, false, false) : this.request("/session/revoke", "POST", {})).catch(() => void 0) : Promise.resolve();
     const clearing = this.clearLocal(), clearedEpoch = this.epoch;
     await Promise.all([revocation, clearing]);
     if (this.current(clearedEpoch)) this.emit();
@@ -7940,6 +8056,10 @@ var ConnectionDetails = class extends import_obsidian.Modal {
       if (account.session_policy?.mode === "sliding") {
         this.contentEl.createEl("p", { text: `\u8FDE\u63A5\uFF1A\u4F7F\u7528\u65F6\u81EA\u52A8\u7EED\u671F\uFF1B\u6BCF\u6B21\u6388\u6743\u6709\u6548\u671F ${account.session_policy.idle_days} \u5929\uFF0C\u8D85\u51FA\u5F53\u524D\u6709\u6548\u671F\u9700\u91CD\u65B0\u914D\u5BF9\u3002` });
         this.contentEl.createEl("p", { text: `\u5F53\u524D\u6388\u6743\u6709\u6548\u81F3\uFF1A${new Date(account.expires_at).toLocaleString()}` });
+      } else if (account.session_policy?.mode === "rotating") {
+        this.contentEl.createEl("p", { text: `\u8FDE\u63A5\uFF1A\u8BBF\u95EE\u51ED\u636E\u6BCF ${account.session_policy.access_minutes} \u5206\u949F\u5931\u6548\u5E76\u81EA\u52A8\u8F6E\u6362\uFF0C\u95F2\u7F6E ${account.session_policy.idle_days} \u5929\u540E\u9700\u91CD\u65B0\u914D\u5BF9\u3002` });
+        this.contentEl.createEl("p", { text: `\u5F53\u524D\u6388\u6743\u6709\u6548\u81F3\uFF1A${new Date(account.expires_at).toLocaleString()}` });
+        if (account.absolute_expires_at) this.contentEl.createEl("p", { text: `\u6700\u8FDF\u91CD\u65B0\u914D\u5BF9\uFF1A${new Date(account.absolute_expires_at).toLocaleString()}` });
       } else this.contentEl.createEl("p", { text: `\u8FDE\u63A5\u5230\u671F\uFF1A${new Date(account.expires_at).toLocaleString()}` });
       this.contentEl.createEl("p", { text: "\u6765\u6E90\u548C\u6458\u8981\u6309\u5185\u5BB9\u7248\u672C\u6821\u9A8C\u3002\u81EA\u52A8\u6982\u5FF5\u7684\u5DEE\u5F02\u548C\u6761\u4EF6\u64A4\u9500\u53EF\u5728\u53D8\u66F4\u5386\u53F2\u4E2D\u67E5\u770B\u3002" });
     }
