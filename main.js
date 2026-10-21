@@ -8098,6 +8098,7 @@ var ServiceAddressModal = class extends import_obsidian.Modal {
     this.alive = false;
   }
   onOpen() {
+    this.contentEl.addClass("va-dialog");
     this.alive = true;
     this.titleEl.setText("\u8BBE\u7F6E\u670D\u52A1\u5730\u5740");
     const controller = this.plugin.controller;
@@ -8176,6 +8177,7 @@ var History = class extends import_obsidian.Modal {
     this.stop = null;
   }
   onOpen() {
+    this.contentEl.addClass("va-dialog");
     this.alive = true;
     this.session = this.plugin.controller.sessionKey();
     this.titleEl.setText("\u5386\u53F2\u5BF9\u8BDD");
@@ -10170,6 +10172,7 @@ var AutomationSettingsModal = class extends import_obsidian4.Modal {
     return this.alive && !!this.bindingScope && this.bindingScope === this.controller.sessionKey();
   }
   onOpen() {
+    this.contentEl.addClass("va-dialog");
     this.alive = true;
     this.modalEl.addClass("va-automation-modal");
     this.titleEl.setText("\u81EA\u52A8\u6458\u8981\u4E0E\u77E5\u8BC6\u7F51\u7EDC");
@@ -10392,6 +10395,7 @@ var AutomationHistoryModal = class extends import_obsidian4.Modal {
     return this.alive && this.bindingScope === this.controller.sessionKey() && !!this.bindingScope && revision === this.revision;
   }
   onOpen() {
+    this.contentEl.addClass("va-dialog");
     this.alive = true;
     this.modalEl.addClass("va-automation-modal");
     this.titleEl.setText("\u81EA\u52A8\u6982\u5FF5\u53D8\u66F4\u5386\u53F2");

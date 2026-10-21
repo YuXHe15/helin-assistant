@@ -1,4 +1,4 @@
-# Helin Assistant 0.4.12
+# Helin Assistant 0.4.13
 
 在 Obsidian 原文旁阅读短摘要，在后台连接已有知识、补充必要的知识页，并查看或安全撤销自动修改。支持简繁显示和摘要内公式、代码排版。
 
@@ -46,11 +46,11 @@ Minimum Obsidian version: **1.11.4**. **iPadOS is a mobile release target; physi
 
 社区目录是否已收录、哪个版本可安装，以 [Obsidian 社区目录](https://community.obsidian.md/plugins) 实际显示为准。本说明与本地构建不代表审核已经通过。
 
-Before installing version **0.4.12**, verify that its matching [GitHub release](https://github.com/YuXHe15/helin-assistant/releases) exists. These instructions do not claim that this version has already been published or accepted into the community directory.
+Before installing version **0.4.13**, verify that its matching [GitHub release](https://github.com/YuXHe15/helin-assistant/releases) exists. These instructions do not claim that this version has already been published or accepted into the community directory.
 
 - **社区目录 / Community directory**：收录后，在 Obsidian 的第三方插件浏览中搜索 **Helin Assistant**，安装并启用。
 - **试用 / BRAT**：安装 [BRAT](https://github.com/TfTHacker/obsidian42-brat)，添加 `YuXHe15/helin-assistant`，选择已发布的目标版本，再启用 Helin Assistant。普通安装不需要 GitHub 令牌。
-- **桌面手动安装 / Desktop manual installation**：下载同版本 `helin-assistant-0.4.12.zip`，将其中的 `helin-assistant` 文件夹放到 Vault 的 `.obsidian/plugins/`。更新时替换发布文件，保留已有本机配置与配对。
+- **桌面手动安装 / Desktop manual installation**：下载同版本 `helin-assistant-0.4.13.zip`，将其中的 `helin-assistant` 文件夹放到 Vault 的 `.obsidian/plugins/`。更新时替换发布文件，保留已有本机配置与配对。
 
 安装目录内的运行文件是 `manifest.json`、`main.js` 和 `styles.css`。保留随包附带的 `LICENSE`、`COPYRIGHT.txt` 和 `THIRD_PARTY_NOTICES.txt`；许可证也附在 `main.js` 中，覆盖只下载运行文件的安装方式。不要复制他人的 `data.json` 或秘密存储。
 

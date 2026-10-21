@@ -1,7 +1,7 @@
 {
   "id": "helin-assistant",
   "name": "Helin Assistant",
-  "version": "0.4.12",
+  "version": "0.4.13",
   "minAppVersion": "1.11.4",
   "description": "Read AI summaries beside notes, connect related knowledge, and review or undo background changes through an authorized assistant service.",
   "author": "ObsidianSync",

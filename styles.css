@@ -1,5 +1,5 @@
 .vault-assistant { display: flex; flex-direction: column; min-height: 0; height: 100%; padding: 0; overflow: hidden; }
-.vault-assistant [hidden] { display: none !important; }
+.vault-assistant [hidden], .va-dialog [hidden] { display: none !important; }
 .va-identity { display: flex; gap: 8px; align-items: center; flex: none; padding: 8px 12px; border-bottom: 1px solid var(--background-modifier-border); color: var(--text-muted); font-size: var(--font-ui-small); }
 .va-scope { display: flex; align-items: center; gap: 4px; flex: 1; min-width: 0; }
 .va-scope-user, .va-scope-vault { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
