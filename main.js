@@ -742,6 +742,9 @@ var AssistantController = class {
     this.durableToken = null;
     this.epoch = 0;
     this.selection = 0;
+    this.mutationSequence = 0;
+    this.mutations = /* @__PURE__ */ new Map();
+    this.modeRevision = 0;
     this.pollEpoch = 0;
     this.persistence = Promise.resolve();
     this.secretPersistence = Promise.resolve();
@@ -918,7 +921,7 @@ var AssistantController = class {
     this.state.jobs = {};
     this.state.jobLoading = {};
     this.state.jobErrors = {};
-    this.state.posting = false;
+    this.syncPosting();
     this.state.uncertain = false;
     this.state.busy = false;
     this.state.error = null;
@@ -958,6 +961,21 @@ var AssistantController = class {
       sha256: sha2562,
       ...draft.selected_text ? { text: draft.selected_text } : {}
     }, draft.graph);
+  }
+  syncPosting() {
+    this.state.posting = this.mutations.has("session-mode") || !!(this.state.chat && this.mutations.has(this.state.chat.id));
+  }
+  beginMutation(key) {
+    const operation = ++this.mutationSequence;
+    this.mutations.set(key, operation);
+    this.syncPosting();
+    return operation;
+  }
+  endMutation(key, operation, epoch) {
+    if (!this.current(epoch) || this.mutations.get(key) !== operation) return;
+    this.mutations.delete(key);
+    this.syncPosting();
+    this.emit();
   }
   emit() {
     for (const listener of this.listeners) listener();
@@ -1114,7 +1132,7 @@ var AssistantController = class {
   async accountFromServer(epoch) {
     if (this.credential?.session_protocol === "rotating-v1" || this.credential?.pending_session) await this.renewIfDue(epoch);
     if (!this.current(epoch)) return null;
-    const previous = this.credential;
+    const previous = this.credential, modeRevision = this.modeRevision;
     const response = await this.request("/me", "GET", void 0, true, false), account = response.json;
     if (!this.current(epoch)) return null;
     this.assertAccount(account);
@@ -1127,7 +1145,7 @@ var AssistantController = class {
     const result = { ...account };
     delete result.session_policy;
     delete result.renew_after;
-    return { ...result, read_only: account.read_only ?? false, ...sessionMetadata(this.credential, this.now()) };
+    return { ...result, read_only: modeRevision !== this.modeRevision && this.state.account ? !!this.state.account.read_only : account.read_only ?? false, ...sessionMetadata(this.credential, this.now()) };
   }
   async request(path, method = "GET", body, auth = true, renew = true, query, retryAuth = true) {
     if (!path.startsWith("/") || path.includes("..") || /[?#]/.test(path)) throw new ApiError(400);
@@ -1173,7 +1191,8 @@ var AssistantController = class {
   /** Automation uses the same paired credential/renewal and cannot outlive its binding. */
   async requestAutomation(path, method = "GET", body, query, background = false) {
     const allowed = method === "GET" ? /^\/(?:policy|summary|batches(?:\/[a-f0-9]{32})?)$/ : /^\/(?:policy|scan|batches\/[a-f0-9]{32}\/undo)$/;
-    if (!allowed.test(path) || query && (path !== "/summary" || method !== "GET" || !safeNotePath(query.path)) || path === "/summary" && !query) throw new ApiError(400);
+    const validQuery = !query || method === "GET" && (path === "/summary" ? Object.keys(query).length === 1 && safeNotePath(query.path) : path === "/batches" && Object.entries(query).every(([key, value]) => typeof value === "string" && (key === "limit" ? /^(?:[1-9]|[1-9]\d|100)$/.test(value) : key === "cursor" ? this.validCursor(value) : key === "source_path" && safeNotePath(value))));
+    if (!allowed.test(path) || !validQuery || path === "/summary" && !query) throw new ApiError(400);
     const epoch = this.epoch, scope = this.sessionKey();
     if (!scope || this.state.phase !== "ready") throw new ApiError(401);
     try {
@@ -1228,6 +1247,8 @@ var AssistantController = class {
     this.dagContexts.clear();
     this.dagRevisions.clear();
     this.dagSubmissions.clear();
+    this.mutations.clear();
+    this.modeRevision++;
     this.credential = null;
     this.durableToken = null;
     this.state = emptyState();
@@ -1261,6 +1282,8 @@ var AssistantController = class {
     this.dagContexts.clear();
     this.dagRevisions.clear();
     this.dagSubmissions.clear();
+    this.mutations.clear();
+    this.modeRevision++;
     this.credential = null;
     this.durableToken = null;
     this.state = emptyState();
@@ -1459,6 +1482,7 @@ var AssistantController = class {
         this.setDetail(detail.json, chatId);
       }
       if (selection !== this.selection) return;
+      if (!chatId) this.state.uncertain = false;
       this.state.busy = false;
       this.state.error = null;
       this.emit();
@@ -1471,7 +1495,7 @@ var AssistantController = class {
   }
   async newChat(title) {
     if (this.state.busy || this.state.phase !== "ready") return;
-    const epoch = this.epoch;
+    const epoch = this.epoch, selection = this.selection;
     this.state.busy = true;
     this.state.error = null;
     this.emit();
@@ -1482,11 +1506,75 @@ var AssistantController = class {
       const chat = record(response.json).chat;
       requireId(chat?.id);
       this.assertScope(chat);
-      this.state.busy = false;
-      await this.refreshChats();
-      if (this.current(epoch) && this.state.phase === "ready") await this.selectChat(chat.id);
+      if (selection === this.selection) this.state.busy = false;
+      this.activateTab(chat);
+      if (!this.state.chats.some((item) => item.id === chat.id)) this.state.chats.unshift(chat);
+      this.emit();
+      if (selection === this.selection && this.state.phase === "ready") await this.selectChat(chat.id);
+      else await this.persistTabs();
+    } catch (error2) {
+      if (selection === this.selection || authError(error2)) await this.fail(error2, epoch);
+    }
+  }
+  validCursor(value) {
+    return typeof value === "string" && value.length > 0 && value.length <= 4096 && !/[\p{Cc}\p{Cf}]/u.test(value);
+  }
+  async listChats(archived = false, cursor) {
+    if (typeof archived !== "boolean" || cursor !== void 0 && !this.validCursor(cursor)) throw new ApiError(400);
+    const epoch = this.epoch, scope = this.sessionKey();
+    if (!scope || this.state.phase !== "ready") throw new ApiError(401);
+    try {
+      const paginated = !!this.state.account?.history_pagination_enabled;
+      if (!paginated && (archived || cursor)) throw new ApiError(400);
+      const response = await this.request(
+        "/chats",
+        "GET",
+        void 0,
+        true,
+        true,
+        paginated ? { limit: "50", archived: String(archived), ...cursor ? { cursor } : {} } : void 0
+      );
+      if (!this.current(epoch) || scope !== this.sessionKey()) throw new ApiError(409, "stale");
+      const data = record(response.json);
+      if (!Array.isArray(data.chats) || data.chats.length > (paginated ? 50 : 100) || data.next_cursor != null && (!this.validCursor(data.next_cursor) || data.next_cursor === cursor)) throw new ApiError(500);
+      const chats = data.chats;
+      for (const chat of chats) {
+        requireId(chat.id);
+        this.assertScope(chat);
+        if (typeof chat.title !== "string" || chat.archived !== void 0 && chat.archived !== archived) throw new ApiError(500);
+      }
+      return { chats, next_cursor: data.next_cursor ?? null };
+    } catch (error2) {
+      if (authError(error2)) await this.fail(error2, epoch);
+      throw error2 instanceof ApiError ? error2 : new ApiError(500);
+    }
+  }
+  async setChatArchived(chatId, archived) {
+    if (!validId(chatId) || typeof archived !== "boolean" || !this.state.account?.chat_archive_enabled || this.state.phase !== "ready" || this.mutations.has(chatId)) return false;
+    const epoch = this.epoch, operation = this.beginMutation(chatId);
+    try {
+      const response = await this.request(`/chats/${chatId}`, "PATCH", { archived });
+      if (!this.current(epoch)) return false;
+      const chat = record(response.json).chat;
+      if (!chat || chat.id !== chatId || chat.archived !== archived || typeof chat.title !== "string") throw new ApiError(500);
+      this.assertScope(chat);
+      this.state.chats = this.state.chats.filter((item) => item.id !== chatId);
+      if (!archived) this.state.chats.unshift(chat);
+      if (archived) await this.closeChatTab(chatId);
+      else {
+        this.state.tabs = this.state.tabs.map((item) => item.id === chatId ? { ...chat } : item);
+        if (this.state.chat?.id === chatId) this.state.chat = { ...chat };
+      }
+      if (this.current(epoch)) {
+        this.state.error = null;
+        this.emit();
+      }
+      return true;
     } catch (error2) {
       await this.fail(error2, epoch);
+      return false;
+    } finally {
+      this.endMutation(chatId, operation, epoch);
     }
   }
   setDetail(value, chatId) {
@@ -1537,6 +1625,7 @@ var AssistantController = class {
     this.assertScope(job);
   }
   async selectChat(chatId) {
+    if (this.state.chat?.id === chatId) return;
     const epoch = this.epoch, selection = ++this.selection, poll = ++this.pollEpoch;
     if (this.state.chat?.id !== chatId) {
       this.state.chat = null;
@@ -1547,7 +1636,7 @@ var AssistantController = class {
       this.state.jobs = {};
       this.state.jobLoading = {};
       this.state.jobErrors = {};
-      this.state.posting = false;
+      this.syncPosting();
       this.state.uncertain = false;
     }
     this.state.busy = true;
@@ -1558,6 +1647,7 @@ var AssistantController = class {
       const response = await this.request(`/chats/${chatId}`);
       if (!this.current(epoch) || selection !== this.selection) return;
       this.setDetail(response.json, chatId);
+      this.syncPosting();
       this.state.busy = false;
       this.emit();
       await this.persistTabs();
@@ -1570,19 +1660,15 @@ var AssistantController = class {
   }
   async send(prompt, draftRevision) {
     const chatId = this.state.chat?.id;
-    if (!chatId || this.state.phase !== "ready" || this.state.busy || this.state.posting || this.state.uncertain || activeJob(this.state.job) || !prompt.trim()) return false;
-    const epoch = this.epoch, selection = this.selection, poll = ++this.pollEpoch;
-    const originalDraft = this.getDraft(chatId);
-    this.state.posting = true;
+    if (!chatId || this.state.chat?.archived || this.state.phase !== "ready" || this.state.busy || this.state.posting || this.state.uncertain || activeJob(this.state.job) || !prompt.trim()) return false;
+    const epoch = this.epoch, selection = this.selection;
+    this.pollEpoch++;
+    const originalDraft = this.getDraft(chatId), operation = this.beginMutation(chatId);
     this.state.error = null;
     this.emit();
     try {
       if (prompt.trim().length > 4e3) throw new ApiError(400);
       if (this.adapters.preparePrompt && !await this.adapters.preparePrompt(prompt.trim(), () => this.current(epoch) && selection === this.selection)) {
-        if (this.current(epoch) && selection === this.selection) {
-          this.state.posting = false;
-          this.emit();
-        }
         return false;
       }
       if (!this.current(epoch) || selection !== this.selection) return false;
@@ -1598,22 +1684,22 @@ var AssistantController = class {
       }
       const draft = this.getDraft(chatId);
       if (draftRevision !== void 0 && draft.revision === draftRevision && draftRevision === originalDraft.revision && draft.text === prompt) this.updateDraft(chatId, "");
-      if (selection !== this.selection) return true;
+      if (this.state.chat?.id !== chatId) return true;
       const id = record(response.json).user_message_id;
       this.state.messages.push({ id: Number.isSafeInteger(id) && id > 0 ? id : `pending-${jobId}`, role: "user", content: prompt.trim(), job_id: jobId });
       this.state.job = { id: jobId, chat_id: chatId, status: "pending", created_at: new Date(this.now()).toISOString() };
       this.state.jobs[jobId] = this.state.job;
-      this.state.posting = false;
       this.emit();
-      void this.pollJob(chatId, jobId, epoch, selection, poll);
+      void this.pollJob(chatId, jobId, epoch, this.selection, ++this.pollEpoch);
       return true;
     } catch (error2) {
-      if (this.current(epoch) && (selection === this.selection || authError(error2))) {
-        this.state.posting = false;
+      if (this.current(epoch) && (this.state.chat?.id === chatId || authError(error2))) {
         if (error2 instanceof ApiError && error2.status === 0) this.state.uncertain = true;
         await this.fail(error2, epoch);
       }
       return false;
+    } finally {
+      this.endMutation(chatId, operation, epoch);
     }
   }
   async prepareDag(jobId, target) {
@@ -1629,8 +1715,8 @@ var AssistantController = class {
   async setReadOnly(readOnly) {
     if (typeof readOnly !== "boolean" || this.state.phase !== "ready" || !this.state.account || this.state.busy || this.state.posting || this.state.uncertain || activeJob(this.state.job)) return false;
     if (!!this.state.account.read_only === readOnly) return true;
-    const epoch = this.epoch, selection = this.selection;
-    this.state.posting = true;
+    const epoch = this.epoch, operation = this.beginMutation("session-mode");
+    this.modeRevision++;
     this.state.error = null;
     this.emit();
     try {
@@ -1638,52 +1724,53 @@ var AssistantController = class {
       if (!this.current(epoch)) return false;
       const value = record(response.json).read_only;
       if (typeof value !== "boolean" || value !== readOnly) throw new ApiError(500);
+      this.modeRevision++;
       if (this.state.account) this.state.account = { ...this.state.account, read_only: value };
-      if (selection === this.selection) this.state.posting = false;
       this.emit();
       return true;
     } catch (error2) {
-      if (this.current(epoch) && (selection === this.selection || authError(error2))) {
-        this.state.posting = false;
+      if (this.current(epoch)) {
         if (error2 instanceof ApiError && error2.status === 0) this.state.uncertain = true;
         await this.fail(error2, epoch);
       }
       return false;
+    } finally {
+      this.endMutation("session-mode", operation, epoch);
     }
   }
   async startOperation(suffix, body, rejection = false) {
     const chatId = this.state.chat?.id;
-    if (!chatId || this.state.phase !== "ready" || this.state.busy || this.state.posting || this.state.uncertain || activeJob(this.state.job)) return false;
-    const epoch = this.epoch, selection = this.selection, poll = ++this.pollEpoch;
-    this.state.posting = true;
+    if (!chatId || this.state.chat?.archived || this.state.phase !== "ready" || this.state.busy || this.state.posting || this.state.uncertain || activeJob(this.state.job)) return false;
+    const epoch = this.epoch;
+    this.pollEpoch++;
+    const operation = this.beginMutation(chatId);
     this.state.error = null;
     this.emit();
     try {
       const response = await this.request(`/chats/${chatId}${suffix}`, "POST", body);
       if (!this.current(epoch)) return false;
-      if (selection !== this.selection) return true;
+      if (this.state.chat?.id !== chatId) return true;
       if (rejection) {
         const detail = await this.request(`/chats/${chatId}`);
-        if (!this.current(epoch) || selection !== this.selection) return true;
+        if (!this.current(epoch) || this.state.chat?.id !== chatId) return true;
         this.setDetail(detail.json, chatId);
-        this.state.posting = false;
         this.emit();
         return true;
       }
       const id = requireId(record(response.json).job_id);
       this.state.job = { id, chat_id: chatId, status: "pending", created_at: new Date(this.now()).toISOString() };
       this.state.jobs[id] = this.state.job;
-      this.state.posting = false;
       this.emit();
-      void this.pollJob(chatId, id, epoch, selection, poll);
+      void this.pollJob(chatId, id, epoch, this.selection, ++this.pollEpoch);
       return true;
     } catch (error2) {
-      if (this.current(epoch) && (selection === this.selection || authError(error2))) {
-        this.state.posting = false;
+      if (this.current(epoch) && (this.state.chat?.id === chatId || authError(error2))) {
         if (error2 instanceof ApiError && error2.status === 0) this.state.uncertain = true;
         await this.fail(error2, epoch);
       }
       return false;
+    } finally {
+      this.endMutation(chatId, operation, epoch);
     }
   }
   async loadJob(jobId) {
@@ -2209,10 +2296,10 @@ function decodeTrieDict(input, resultLength, atomCount, dict1AtomCount, ngramCou
   single.fill(-1, dictSize + dict2AtomCount, slotCount);
   const start = new Int32Array(slotCount);
   const length = new Int32Array(slotCount);
-  function decodeDelta(count, off) {
+  function decodeDelta(count2, off) {
     let previous = 0;
     let slot = off;
-    const end = off + count;
+    const end = off + count2;
     while (slot < end) {
       const code2 = BASE91_INVERSE[input.charCodeAt(pos++)];
       if (code2 < 89) {
@@ -2235,8 +2322,8 @@ function decodeTrieDict(input, resultLength, atomCount, dict1AtomCount, ngramCou
   const references = new Int32Array(ngramCount * 2);
   let poolSize = 0;
   let ngramIndex = 0;
-  function readNgramReferences(count, startSlot) {
-    for (let index = 0; index < count; index++) {
+  function readNgramReferences(count2, startSlot) {
+    for (let index = 0; index < count2; index++) {
       const slot = startSlot + index;
       const a2 = readSlotCode();
       const b2 = readSlotCode();
@@ -5790,7 +5877,7 @@ var StateInline = class {
     }
     let pos = start;
     while (pos < max && this.src.charCodeAt(pos) === marker2) pos++;
-    const count = pos - start;
+    const count2 = pos - start;
     let nextChar = pos < max ? this.src.charCodeAt(pos) : 32;
     if ((nextChar & 64512) === 55296) {
       const lowSurr = this.src.charCodeAt(pos + 1);
@@ -5805,7 +5892,7 @@ var StateInline = class {
     return {
       can_open: left_flanking && (canSplitWord || !right_flanking || isLastPunctChar),
       can_close: right_flanking && (canSplitWord || !left_flanking || isNextPunctChar),
-      length: count
+      length: count2
     };
   }
 };
@@ -7378,7 +7465,9 @@ function createChatTabs(parent, actions) {
   return { root, render(tabs, activeId, disabled = false) {
     if (destroyed) return;
     const wanted = new Set(tabs.map((tab) => tab.id));
+    let removedFocusIndex = null;
     for (const [id, view] of views) if (!wanted.has(id)) {
+      if (view.root.contains(document2.activeElement)) removedFocusIndex = Array.from(root.children).indexOf(view.root);
       view.dispose();
       views.delete(id);
     }
@@ -7401,6 +7490,11 @@ function createChatTabs(parent, actions) {
       view.close.setAttribute("aria-label", `\u5173\u95ED${name}\u6807\u7B7E`);
       view.root.classList.toggle("is-active", selected);
     });
+    if (removedFocusIndex !== null) {
+      const next = activeId ? views.get(activeId) : views.get(tabs[Math.max(0, removedFocusIndex - 1)]?.id);
+      if (next && !next.select.disabled) next.select.focus();
+      else actions.focusFallback?.();
+    }
     if (activeId !== previousActiveId) {
       const selected = activeId ? views.get(activeId)?.root : void 0;
       if (typeof selected?.scrollIntoView === "function") selected.scrollIntoView({ block: "nearest", inline: "nearest" });
@@ -7488,6 +7582,8 @@ var ChatSurface = class {
   constructor(parent, controller, actions) {
     this.controller = controller;
     this.actions = actions;
+    this.readingSession = null;
+    this.readingStates = /* @__PURE__ */ new Map();
     this.views = /* @__PURE__ */ new Map();
     this.legacyViews = /* @__PURE__ */ new Map();
     this.context = "";
@@ -7505,6 +7601,10 @@ var ChatSurface = class {
       close: (id) => {
         this.saveDraft();
         void this.controller.closeChatTab(id);
+      },
+      focusFallback: () => {
+        if (this.actions.focusNewChat) this.actions.focusNewChat();
+        else this.scroll.focus();
       }
     });
     this.scroll = element(parent, "div", "va-scroll");
@@ -7576,7 +7676,7 @@ var ChatSurface = class {
   }
   updateSend() {
     const state = this.controller.state;
-    this.sendButton.disabled = !state.chat || !this.input.value.trim() || state.busy || state.posting || state.uncertain || !state.account?.configured || activeJob(state.job);
+    this.sendButton.disabled = !state.chat || !!state.chat.archived || !this.input.value.trim() || state.busy || state.posting || state.uncertain || !state.account?.configured || activeJob(state.job);
   }
   async send() {
     if (this.sendButton.disabled || !this.chatId || this.composing) return;
@@ -7589,19 +7689,38 @@ var ChatSurface = class {
     if (this.destroyed) return;
     const state = this.controller.state, id = state.chat?.id ?? null;
     this.tabs.render(state.tabs ?? (state.chat ? [state.chat] : []), id, state.phase !== "ready");
-    const context = `${this.controller.sessionKey()}:${id}`;
-    const switched = context !== this.context, following = switched || this.nearBottom();
+    const session = this.controller.sessionKey(), context = `${session}:${id}`;
+    const switched = context !== this.context;
+    let restored;
     if (switched) {
+      if (session !== this.readingSession) {
+        this.readingStates.clear();
+        this.readingSession = session;
+      } else if (this.chatId) {
+        this.readingStates.delete(this.context);
+        this.readingStates.set(this.context, {
+          visibleCount: this.visibleCount,
+          scrollTop: this.scroll.scrollTop,
+          following: this.nearBottom(),
+          views: this.views,
+          legacyViews: this.legacyViews
+        });
+        while (this.readingStates.size > 12) this.readingStates.delete(this.readingStates.keys().next().value);
+      }
+      const saved = this.readingStates.get(context);
+      restored = saved;
       this.context = context;
       this.chatId = id;
       this.composing = false;
-      this.visibleCount = 100;
-      this.views.clear();
-      this.legacyViews.clear();
-      this.list.replaceChildren();
-      this.legacy.replaceChildren();
+      this.visibleCount = saved?.visibleCount ?? 100;
+      this.views = saved?.views ?? /* @__PURE__ */ new Map();
+      this.legacyViews = saved?.legacyViews ?? /* @__PURE__ */ new Map();
+      this.list.replaceChildren(...Array.from(this.views.values(), (view) => view.root));
+      this.legacy.replaceChildren(...Array.from(this.legacyViews.values(), (view) => view.root));
       this.proposals.replaceChildren();
+      delete this.proposals.dataset.signature;
     }
+    const following = switched ? restored?.following ?? true : this.nearBottom();
     this.footer.hidden = state.phase !== "ready";
     this.input.disabled = state.phase !== "ready" || !id;
     const dagContext = this.controller.getDagContext();
@@ -7612,19 +7731,19 @@ var ChatSurface = class {
       this.dagHint.replaceChildren();
       this.dagHint.hidden = !dagContext;
       if (dagContext) {
-        element(this.dagHint, "span", void 0, `DAG\uFF1A${dagContext.source.path} \xB7 ${dagContext.source.start_line}\u2013${dagContext.source.end_line} \u884C`);
+        element(this.dagHint, "span", void 0, `DAG \u5BF9\u8BDD\u5FEB\u7167\uFF1A${dagContext.source.path} \xB7 ${dagContext.source.start_line}\u2013${dagContext.source.end_line} \u884C`);
         control(this.dagHint, "\u9000\u51FA DAG", () => this.controller.clearDagContext());
       }
     }
     this.focusHint.hidden = !!dagContext || !focus;
-    label(this.focusHint, focus ? `\u5F53\u524D\u6BB5\u843D\uFF1A${focus.path} \xB7 ${focus.start_line}\u2013${focus.end_line} \u884C` : "");
+    label(this.focusHint, focus ? `\u5BF9\u8BDD\u5F15\u7528 \xB7 \u68C0\u7D22\u65F6\u5FEB\u7167\uFF1A${focus.path} \xB7 ${focus.start_line}\u2013${focus.end_line} \u884C` : "");
     this.input.placeholder = dagContext ? "\u7EE7\u7EED\u4FEE\u6539\u56FE\uFF0C\u6216\u63CF\u8FF0\u5982\u4F55\u5904\u7406\u8FD9\u6BB5\u8BDD\u2026" : focus ? "\u7EE7\u7EED\u5904\u7406\u8FD9\u6BB5\u8BDD\uFF0C\u6216\u5F00\u59CB\u65B0\u7684\u8BDD\u9898\u2026" : "\u5411\u52A9\u624B\u63D0\u95EE\uFF0C\u6216\u641C\u7D22\u5F53\u524D Vault\u2026";
     const draft = id ? this.controller.getDraft(id) : { text: "", start: 0, end: 0 };
     if (!this.composing && this.input.value !== draft.text) {
       this.input.value = draft.text;
       this.input.setSelectionRange(draft.start, draft.end);
     } else if (switched) this.input.setSelectionRange(draft.start, draft.end);
-    label(this.hint, state.uncertain ? "\u63D0\u4EA4\u7ED3\u679C\u672A\u786E\u8BA4\uFF0C\u8BF7\u5148\u5237\u65B0\u5BF9\u8BDD" : state.posting ? "\u6B63\u5728\u63D0\u4EA4\u2026" : activeJob(state.job) ? "\u4EFB\u52A1\u8FDB\u884C\u4E2D\uFF0C\u53EF\u5148\u5199\u4E0B\u4E00\u95EE" : "\u2318 / Ctrl + Enter \u53D1\u9001");
+    label(this.hint, state.chat?.archived ? "\u5DF2\u5F52\u6863\uFF1B\u8BF7\u5728\u5386\u53F2\u5BF9\u8BDD\u4E2D\u6062\u590D\u540E\u7EE7\u7EED" : state.uncertain ? "\u63D0\u4EA4\u7ED3\u679C\u672A\u786E\u8BA4\uFF0C\u8BF7\u5148\u5237\u65B0\u5BF9\u8BDD" : state.posting ? "\u6B63\u5728\u63D0\u4EA4\u2026" : activeJob(state.job) ? "\u4EFB\u52A1\u8FDB\u884C\u4E2D\uFF0C\u53EF\u5148\u5199\u4E0B\u4E00\u95EE" : "\u2318 / Ctrl + Enter \u53D1\u9001");
     this.updateSend();
     label(this.empty, !id ? state.busy ? "\u6B63\u5728\u52A0\u8F7D\u5BF9\u8BDD\u2026" : "\u65B0\u5EFA\u5BF9\u8BDD\uFF0C\u6216\u4ECE\u5386\u53F2\u4E2D\u7EE7\u7EED\u3002" : !state.messages.length ? "\u8BD5\u7740\u95EE\uFF1A\u67E5\u627E\u76F8\u5173\u7B14\u8BB0\uFF0C\u8BFB\u53D6\u5173\u952E\u6BB5\u843D\u5E76\u7ED9\u51FA\u6765\u6E90\u3002" : "");
     this.empty.hidden = !!id && !!state.messages.length;
@@ -7669,6 +7788,7 @@ var ChatSurface = class {
         });
       }
     }
+    if (restored && !following) this.scroll.scrollTop = restored.scrollTop;
     if (following) {
       this.scroll.scrollTop = this.scroll.scrollHeight;
       this.jump.hidden = true;
@@ -7716,14 +7836,31 @@ var ChatSurface = class {
         const graph = element(view.dag, "div");
         renderDag(graph, draft);
         const buttons = element(view.dag, "div", "va-dag-actions");
+        const verify = async () => {
+          const session = this.controller.sessionKey(), chat = this.controller.state.chat?.id;
+          let valid = false;
+          try {
+            valid = await this.actions.verifyDagSource?.(jobId) ?? true;
+          } catch {
+            return false;
+          }
+          return valid && session === this.controller.sessionKey() && chat === this.controller.state.chat?.id;
+        };
         control(buttons, "\u7EE7\u7EED\u4FEE\u6539", () => {
-          if (this.controller.continueDag(jobId)) this.input.focus();
+          void verify().then((valid) => {
+            if (valid && this.controller.continueDag(jobId)) this.input.focus();
+          });
         });
-        if (this.actions.openDag) control(buttons, "\u9009\u62E9\u63D2\u5165\u4F4D\u7F6E", () => this.actions.openDag?.(jobId)).classList.add("va-dag-insert-action");
+        if (this.actions.openDag) control(buttons, "\u9009\u62E9\u63D2\u5165\u4F4D\u7F6E", () => {
+          void verify().then((valid) => {
+            if (valid) this.actions.openDag?.(jobId);
+          });
+        }).classList.add("va-dag-insert-action");
+        element(view.dag, "p", "va-muted", "\u6765\u6E90\u4E3A\u751F\u6210\u65F6\u7684\u5BF9\u8BDD\u5FEB\u7167\uFF1B\u7EE7\u7EED\u64CD\u4F5C\u524D\u4F1A\u91CD\u65B0\u6838\u5BF9\u672C\u5730\u7B14\u8BB0\u3002");
         element(view.dag, "p", "va-muted va-dag-read-only-hint", "\u53EA\u8BFB\u6A21\u5F0F\u4E0B\u4EC5\u9884\u89C8\uFF0C\u5207\u6362\u6A21\u5F0F\u540E\u53EF\u63D2\u5165\u7B14\u8BB0\u3002");
       }
       const insert = view.dag.querySelector(".va-dag-insert-action");
-      if (insert) insert.disabled = !!state.account?.read_only;
+      if (insert) insert.disabled = !!state.account?.read_only || !!state.chat?.archived;
       const modeHint = view.dag.querySelector(".va-dag-read-only-hint");
       if (modeHint) modeHint.hidden = !state.account?.read_only;
     } else if (view.dag) {
@@ -7868,6 +8005,7 @@ var ChatSurface = class {
   }
   destroy() {
     this.saveDraft();
+    this.readingStates.clear();
     this.destroyed = true;
     this.tabs.destroy();
     if (this.timer) clearInterval(this.timer);
@@ -8022,21 +8160,119 @@ var ServiceAddressModal = class extends import_obsidian.Modal {
     this.contentEl.empty();
   }
 };
-var History = class extends import_obsidian.FuzzySuggestModal {
+var History = class extends import_obsidian.Modal {
   constructor(plugin) {
     super(plugin.app);
     this.plugin = plugin;
-    this.setPlaceholder("\u641C\u7D22\u5BF9\u8BDD\u5386\u53F2");
+    this.items = [];
+    this.cursor = null;
+    this.archived = false;
+    this.query = "";
+    this.loading = false;
+    this.loadFailure = null;
+    this.alive = false;
+    this.revision = 0;
+    this.session = null;
+    this.stop = null;
   }
-  getItems() {
-    return this.plugin.controller.state.chats;
+  onOpen() {
+    this.alive = true;
+    this.session = this.plugin.controller.sessionKey();
+    this.titleEl.setText("\u5386\u53F2\u5BF9\u8BDD");
+    const controls = new import_obsidian.Setting(this.contentEl).setName("\u5BF9\u8BDD\u8303\u56F4");
+    if (this.plugin.controller.state.account?.chat_archive_enabled) controls.addDropdown((dropdown) => dropdown.addOption("active", "\u672A\u5F52\u6863").addOption("archived", "\u5DF2\u5F52\u6863").setValue("active").onChange((value) => {
+      this.archived = value === "archived";
+      void this.load(false);
+    }));
+    controls.addSearch((search) => search.setPlaceholder("\u641C\u7D22\u5DF2\u52A0\u8F7D\u7684\u5BF9\u8BDD").onChange((value) => {
+      this.query = value;
+      this.renderItems();
+    }));
+    this.contentEl.createEl("p", { cls: "va-muted", text: "\u5173\u95ED\u6807\u7B7E\u53EA\u9690\u85CF\u6807\u7B7E\u3002\u5F52\u6863\u4FDD\u7559\u5168\u90E8\u6D88\u606F\u3001\u4EFB\u52A1\u548C\u6765\u6E90\uFF0C\u53EF\u4EE5\u6062\u590D\u3002\u641C\u7D22\u4F1A\u7B5B\u9009\u5DF2\u52A0\u8F7D\u7684\u8BB0\u5F55\u3002" });
+    this.status = this.contentEl.createDiv({ cls: "va-muted", attr: { role: "status", "aria-live": "polite" } });
+    this.rows = this.contentEl.createDiv({ cls: "va-chat-history" });
+    this.more = this.contentEl.createEl("button", { text: "\u52A0\u8F7D\u66F4\u591A\u5BF9\u8BDD" });
+    this.more.onclick = () => {
+      void this.load(true);
+    };
+    this.stop = this.plugin.controller.subscribePassive(() => {
+      if (this.session !== this.plugin.controller.sessionKey()) this.close();
+    });
+    void this.load(false);
   }
-  getItemText(chat) {
-    const date = chat.created_at && Number.isFinite(Date.parse(chat.created_at)) ? new Date(chat.created_at).toLocaleString() : "";
-    return `${chat.title || "\u65B0\u5BF9\u8BDD"}${date ? ` \xB7 ${date}` : ""}`;
+  async load(append) {
+    if (append && (this.loading || !this.cursor)) return;
+    const revision = ++this.revision, archived = this.archived;
+    this.loading = true;
+    this.loadFailure = null;
+    this.more.disabled = true;
+    this.status.setText("\u6B63\u5728\u52A0\u8F7D\u5BF9\u8BDD\u2026");
+    if (!append) {
+      this.items = [];
+      this.cursor = null;
+      this.renderItems();
+    }
+    try {
+      const page = await this.plugin.controller.listChats(archived, append ? this.cursor : void 0);
+      if (!this.alive || revision !== this.revision || this.session !== this.plugin.controller.sessionKey()) return;
+      const existing = new Set(this.items.map((chat) => chat.id));
+      this.items.push(...page.chats.filter((chat) => !existing.has(chat.id)));
+      this.cursor = page.next_cursor;
+      this.loading = false;
+      this.renderItems();
+    } catch (error2) {
+      if (!this.alive || revision !== this.revision) return;
+      this.loading = false;
+      this.loadFailure = { message: error2 instanceof Error ? error2.message : "\u65E0\u6CD5\u52A0\u8F7D\u5BF9\u8BDD\uFF0C\u8BF7\u91CD\u8BD5\u3002", append };
+      this.renderItems();
+    }
   }
-  onChooseItem(chat) {
-    run(() => this.plugin.controller.selectChat(chat.id));
+  renderItems() {
+    this.rows.empty();
+    const query = this.query.trim().toLocaleLowerCase();
+    const visible = this.items.filter((chat) => !query || chat.title.toLocaleLowerCase().includes(query));
+    for (const chat of visible) {
+      const date = chat.updated_at || chat.created_at;
+      const time = date && Number.isFinite(Date.parse(date)) ? new Date(date).toLocaleString() : "";
+      const row = new import_obsidian.Setting(this.rows).setName(chat.title || "\u65B0\u5BF9\u8BDD").setDesc(`${time}${chat.archived ? " \xB7 \u5DF2\u5F52\u6863" : ""}`);
+      row.addButton((button) => button.setButtonText(chat.archived ? "\u67E5\u770B" : "\u6253\u5F00").onClick(() => {
+        run(async () => {
+          await this.plugin.controller.selectChat(chat.id);
+          if (this.alive) this.close();
+        });
+      }));
+      if (this.plugin.controller.state.account?.chat_archive_enabled) row.addButton((button) => button.setButtonText(this.archived ? "\u6062\u590D" : "\u5F52\u6863").onClick(() => {
+        button.setDisabled(true);
+        const revision = this.revision, archived = !this.archived;
+        run(async () => {
+          const ok = await this.plugin.controller.setChatArchived(chat.id, archived);
+          if (!this.alive || revision !== this.revision) return;
+          if (ok) {
+            this.items = this.items.filter((item) => item.id !== chat.id);
+            this.renderItems();
+          } else {
+            button.setDisabled(false);
+            this.status.setText(this.plugin.controller.state.error || "\u64CD\u4F5C\u672A\u5B8C\u6210\uFF0C\u8BF7\u7B49\u5F85\u5F53\u524D\u4EFB\u52A1\u7ED3\u675F\u540E\u91CD\u8BD5\u3002");
+          }
+        });
+      }));
+    }
+    if (!this.loading) this.status.setText(this.loadFailure?.message ?? `\u5DF2\u52A0\u8F7D ${this.items.length} \u4E2A${this.archived ? "\u5F52\u6863" : ""}\u5BF9\u8BDD${query ? `\uFF0C\u5339\u914D ${visible.length} \u4E2A` : ""}${!this.cursor ? " \xB7 \u5DF2\u5230\u672B\u5C3E" : ""}`);
+    if (!visible.length && !this.loading) this.rows.createEl("p", { cls: "va-muted", text: query ? "\u5DF2\u52A0\u8F7D\u7684\u8BB0\u5F55\u4E2D\u6CA1\u6709\u5339\u914D\u9879\u3002\u53EF\u7EE7\u7EED\u52A0\u8F7D\u6216\u8C03\u6574\u641C\u7D22\u3002" : "\u8FD9\u91CC\u8FD8\u6CA1\u6709\u5BF9\u8BDD\u3002" });
+    this.more.hidden = !this.cursor && !this.loadFailure;
+    this.more.disabled = this.loading;
+    this.more.setText(this.loading ? "\u6B63\u5728\u52A0\u8F7D\u2026" : this.loadFailure ? "\u91CD\u8BD5\u52A0\u8F7D" : "\u52A0\u8F7D\u66F4\u591A\u5BF9\u8BDD");
+    this.more.onclick = () => {
+      void this.load(this.loadFailure?.append ?? true);
+    };
+  }
+  onClose() {
+    this.alive = false;
+    this.revision++;
+    this.stop?.();
+    this.stop = null;
+    this.items = [];
+    this.contentEl.empty();
   }
 };
 var ConnectionDetails = class extends import_obsidian.Modal {
@@ -8102,10 +8338,7 @@ var AssistantView = class extends import_obsidian.ItemView {
       { icon: "plus", label: "\u65B0\u5BF9\u8BDD", run: () => run(() => this.plugin.controller.newChat()) },
       { icon: "history", label: "\u5386\u53F2\u5BF9\u8BDD", run: () => {
         if (this.plugin.controller.state.phase !== "ready" || this.plugin.controller.state.busy) return;
-        run(async () => {
-          await this.plugin.controller.refreshChats();
-          if (this.plugin.controller.state.phase === "ready") new History(this.plugin).open();
-        });
+        new History(this.plugin).open();
       } },
       { icon: "ellipsis", label: "\u66F4\u591A", run: (event) => this.more(event) }
     ], (button, icon, text4) => {
@@ -8122,7 +8355,9 @@ var AssistantView = class extends import_obsidian.ItemView {
         if (safe) browser(safe);
       },
       openDag: (job) => this.plugin.openDag(job),
-      openProposal: (proposal) => this.plugin.openProposal(proposal)
+      openProposal: (proposal) => this.plugin.openProposal(proposal),
+      verifyDagSource: (job) => this.plugin.verifyDagSource(job),
+      focusNewChat: () => this.nativeActions[0]?.focus()
     });
     const composerScope = new import_obsidian.Scope(this.scope);
     this.shortcuts = bindComposerShortcuts(this.surface.input, {
@@ -8154,6 +8389,10 @@ var AssistantView = class extends import_obsidian.ItemView {
   more(event) {
     const menu = new import_obsidian.Menu(), controller = this.plugin.controller, ready = controller.state.phase === "ready";
     menu.addItem((item) => item.setTitle("\u5237\u65B0\u8FDE\u63A5\u4E0E\u5BF9\u8BDD").setIcon("refresh-cw").setDisabled(!ready).onClick(() => run(() => controller.refresh())));
+    if (controller.state.account?.chat_archive_enabled && controller.state.chat) {
+      const chat = controller.state.chat;
+      menu.addItem((item) => item.setTitle(chat.archived ? "\u6062\u590D\u5F53\u524D\u5BF9\u8BDD" : "\u5F52\u6863\u5F53\u524D\u5BF9\u8BDD").setIcon("archive").setDisabled(!ready || controller.state.posting || controller.state.busy || activeJob(controller.state.job)).onClick(() => run(() => controller.setChatArchived(chat.id, !chat.archived))));
+    }
     menu.addItem((item) => item.setTitle("\u8FDE\u63A5\u8BE6\u60C5").setIcon("info").onClick(() => new ConnectionDetails(this.plugin).open()));
     menu.addItem((item) => item.setTitle("\u8BBE\u7F6E\u670D\u52A1\u5730\u5740").setIcon("server").onClick(() => this.plugin.openServiceSettings()));
     menu.addItem((item) => item.setTitle("\u5207\u6362\u7B80\u7E41\u663E\u793A\uFF08\u4E0D\u6539\u539F\u6587\uFF09").setIcon("languages").onClick(() => this.plugin.chineseDisplay.toggle()));
@@ -8542,6 +8781,16 @@ function firstBodyLine(value) {
 function currentSummary(result, hash) {
   return result.status === "ready" && result.artifact?.source_sha256 === hash ? result.artifact : null;
 }
+function summaryUsesRail(availableWidth, fontSize = 16) {
+  const textWidth = Math.max(360, Math.ceil(fontSize * 22.5));
+  return Number.isFinite(availableWidth) && availableWidth >= textWidth + 240 + 40;
+}
+function distinctSummarySections(artifact, source) {
+  const lines = normalizedText(source).split("\n");
+  if (lines[lines.length - 1] === "") lines.pop();
+  const start = firstBodyLine(source), end = lines.length;
+  return artifact.sections.filter((section) => !(section.level === 1 && section.start_line === start && section.end_line === end));
+}
 var summarySources = /* @__PURE__ */ new WeakMap();
 function normalizeSummaryMarkdown(source) {
   let fence2 = null, mathClose = null;
@@ -8627,10 +8876,11 @@ function renderSummary(body, source, options) {
   prepareSummaryPreview(body);
   summarySources.set(body, { source, options, revision: options?.revision });
 }
-function summaryCard(document2, title, summary, compact = false, options) {
+function summaryCard(document2, title, summary, compact = false, options, state) {
   const card = document2.createElement("details");
   card.className = "va-summary-card";
-  card.open = !compact;
+  card.open = true;
+  card.classList.toggle("va-summary-compact", compact);
   const label2 = document2.createElement("summary");
   label2.className = "va-summary-label";
   label2.textContent = title;
@@ -8639,26 +8889,33 @@ function summaryCard(document2, title, summary, compact = false, options) {
   body.className = "va-summary-text";
   renderSummary(body, summary, options);
   card.append(body);
-  if (!compact) {
-    label2.setAttribute("aria-expanded", "false");
-    label2.addEventListener("click", (event) => {
-      event.preventDefault();
-      const expanded = card.classList.toggle("is-expanded");
-      label2.setAttribute("aria-expanded", String(expanded));
-      card.dispatchEvent(new document2.defaultView.Event("va-summary-resize", { bubbles: true }));
-    });
-  }
+  const expand = (expanded) => {
+    card.classList.toggle("is-expanded", expanded);
+    label2.setAttribute("aria-expanded", String(expanded));
+    if (state) state.expanded = expanded;
+  };
+  expand(state?.expanded ?? false);
+  label2.addEventListener("click", (event) => {
+    event.preventDefault();
+    expand(!card.classList.contains("is-expanded"));
+    card.dispatchEvent(new document2.defaultView.Event("va-summary-resize", { bubbles: true }));
+  });
   return card;
 }
-function reconcileSummaryCards(root, cache, items, options) {
+function reconcileSummaryCards(root, cache, items, options, stateFor) {
   const elements = items.map((item) => {
     let card = cache.get(item.key);
     if (!card) {
-      card = summaryCard(root.ownerDocument, item.title, item.summary, false, options);
+      card = summaryCard(root.ownerDocument, item.title, item.summary, false, options, stateFor?.(item.key));
       cache.set(item.key, card);
     }
     const label2 = card.querySelector(".va-summary-label"), body = card.querySelector(".va-summary-text");
     if (label2.textContent !== item.title) label2.textContent = item.title;
+    if (stateFor) {
+      const expanded = stateFor(item.key).expanded;
+      card.classList.toggle("is-expanded", expanded);
+      label2.setAttribute("aria-expanded", String(expanded));
+    }
     renderSummary(body, item.summary, options);
     return card;
   });
@@ -8879,9 +9136,9 @@ function convertChinese(text4, mode) {
   return convert(text4);
 }
 function escaped(text4, at) {
-  let count = 0;
-  while (at > 0 && text4[--at] === "\\") count++;
-  return count % 2 === 1;
+  let count2 = 0;
+  while (at > 0 && text4[--at] === "\\") count2++;
+  return count2 % 2 === 1;
 }
 function referenceKey(label2) {
   return label2.replace(/\\([\[\]\\])/g, "$1").trim().replace(/\s+/g, " ").toLowerCase();
@@ -8965,22 +9222,22 @@ function scanMarkdown(text4) {
   patterns(/<[^>\n]*(?:>|$)/g);
   for (let at = 0; at < text4.length; at++) {
     if (protectedText[at] || text4[at] !== "`" || escaped(text4, at)) continue;
-    let count = 1;
-    while (text4[at + count] === "`") count++;
-    let close = at + count;
+    let count2 = 1;
+    while (text4[at + count2] === "`") count2++;
+    let close = at + count2;
     for (; close < text4.length; close++) {
       if (text4[close] !== "`" || text4[close - 1] === "`") continue;
       let otherCount = 1;
       while (text4[close + otherCount] === "`") otherCount++;
-      if (otherCount === count) break;
+      if (otherCount === count2) break;
       close += otherCount - 1;
     }
     if (close < text4.length) {
-      protect(at, close + count);
-      at = close + count - 1;
+      protect(at, close + count2);
+      at = close + count2 - 1;
     } else {
-      protect(at, at + count);
-      at += count - 1;
+      protect(at, at + count2);
+      at += count2 - 1;
     }
   }
   for (let at = 0; at < text4.length; at++) {
@@ -9130,7 +9387,10 @@ function displayChineseMarkdown(text4, display) {
 }
 
 // src/summaries.ts
-var MIN_WIDE = 850;
+function usesRail(element2) {
+  const fontSize = parseFloat(element2.ownerDocument.defaultView?.getComputedStyle(element2).fontSize ?? "16") || 16;
+  return summaryUsesRail(element2.clientWidth, fontSize);
+}
 var PENDING = "AI \u6458\u8981 \xB7 \u5F85\u66F4\u65B0";
 function statusLabel(status2) {
   return status2 === "disabled" ? "" : status2 === "error" ? "AI \u6458\u8981 \xB7 \u6682\u65F6\u65E0\u6CD5\u68C0\u67E5" : status2 === "locating" ? "AI \u6458\u8981 \xB7 \u6B63\u5728\u5B9A\u4F4D\u7AE0\u8282" : PENDING;
@@ -9141,12 +9401,12 @@ function statusElement(document2, status2, display = (text4) => text4) {
   label2.textContent = display(statusLabel(status2));
   return label2;
 }
-function cards(artifact) {
+function cards(artifact, source) {
   const retry = "\u6682\u672A\u751F\u6210\uFF0C\u8BF7\u5728\u81EA\u52A8\u6458\u8981\u8BBE\u7F6E\u4E2D\u91CD\u8BD5";
   const pending = artifact.failed ? retry : artifact.partial ? "\u6392\u961F\u751F\u6210\u2026" : "\u65E0\u53EF\u6458\u8981\u6B63\u6587";
   return [
     { key: "full", line: 1, title: artifact.failed ? "AI \u5168\u6587\u6458\u8981 \xB7 \u9700\u91CD\u8BD5" : artifact.partial ? "AI \u5168\u6587\u6458\u8981 \xB7 \u90E8\u5206\u5B8C\u6210" : artifact.refreshing ? "AI \u5168\u6587\u6458\u8981 \xB7 \u66F4\u65B0\u4E2D" : "AI \u5168\u6587\u6458\u8981", summary: artifact.summary.trim() ? artifact.summary : pending },
-    ...artifact.sections.map((section) => ({
+    ...(source === void 0 ? artifact.sections : distinctSummarySections(artifact, source)).map((section) => ({
       key: `section:${section.id}`,
       line: section.start_line,
       title: `AI \xB7 ${section.title}`,
@@ -9234,12 +9494,22 @@ var SummaryManager = class {
     this.listeners = /* @__PURE__ */ new Set();
     this.reading = /* @__PURE__ */ new Map();
     this.scope = null;
+    this.expansion = /* @__PURE__ */ new Map();
     this.alive = true;
     this.displayVersion = 0;
     this.displayText = (text4) => this.display(text4);
   }
-  displayCards(artifact) {
-    return cards(artifact).map((card) => ({ ...card, title: this.display(card.title), summary: displayChineseMarkdown(card.summary, this.display) }));
+  displayCards(artifact, source) {
+    return cards(artifact, source).map((card) => ({ ...card, title: this.display(card.title), summary: displayChineseMarkdown(card.summary, this.display) }));
+  }
+  cardState(path, key) {
+    const identity = `${path}\0${key}`;
+    let state = this.expansion.get(identity);
+    if (!state) {
+      state = { expanded: false };
+      this.expansion.set(identity, state);
+    }
+    return state;
   }
   refreshDisplay() {
     this.displayVersion++;
@@ -9252,6 +9522,7 @@ var SummaryManager = class {
       this.scope = this.controller.sessionKey();
       this.cache.clear();
       this.inflight.clear();
+      this.expansion.clear();
       this.notify();
       void this.refreshOpen();
     }));
@@ -9371,6 +9642,7 @@ var SummaryManager = class {
     for (const renderer of this.reading.values()) renderer.destroy();
     this.reading.clear();
     this.listeners.clear();
+    this.expansion.clear();
   }
 };
 var ReadingSummaries = class {
@@ -9491,13 +9763,17 @@ var ReadingSummaries = class {
     if (!this.alive) return;
     this.ensureHost();
     const host = this.host, enabled = this.result.status !== "disabled";
-    const wide = host.clientWidth >= MIN_WIDE;
+    const wide = usesRail(host);
     host.classList.toggle("va-summary-enabled", enabled);
     host.classList.toggle("va-summary-wide", enabled && wide);
     this.root.hidden = !enabled || !wide;
     if (!enabled || !wide) {
       this.root.replaceChildren();
       observeCards(this.observer, this.observedCards, []);
+    }
+    if (!enabled) {
+      this.railCards.clear();
+      this.cardIdentity = "";
     }
     const signature = JSON.stringify([this.result, this.currentPath, this.blockRevision, wide, this.manager.displayVersion]);
     if (!wide && signature === this.compactSignature) return;
@@ -9534,14 +9810,23 @@ var ReadingSummaries = class {
     }
     const anchors = /* @__PURE__ */ new Map();
     for (const [, block2] of blocks) for (const heading2 of block2.headings) anchors.set(heading2.line, heading2.element);
-    const targets = this.manager.displayCards(artifact).flatMap((card, index) => {
+    const targets = this.manager.displayCards(artifact, this.view.previewMode.get()).flatMap((card, index) => {
       const anchor = index === 0 ? first : anchors.get(card.line);
       return anchor ? [{ ...card, anchor }] : [];
     });
+    const identity = this.currentPath;
+    if (identity !== this.cardIdentity) {
+      this.railCards.clear();
+      this.cardIdentity = identity;
+    }
     if (!wide) {
-      for (const target of targets) {
-        const card = summaryCard(host.ownerDocument, target.title, target.summary, true, this.manager.renderOptions);
-        if (target.anchor === first && target.title.includes("\u5168\u6587")) first.prepend(card);
+      const staging = host.ownerDocument.createElement("div");
+      const elements2 = reconcileSummaryCards(staging, this.railCards, targets, this.manager.renderOptions, (key) => this.manager.cardState(this.currentPath, key));
+      for (let index = 0; index < targets.length; index++) {
+        const target = targets[index], card = elements2[index];
+        card.classList.add("va-summary-compact");
+        card.style.removeProperty("top");
+        if (target.key === "full") target.anchor.prepend(card);
         else target.anchor.after(card);
         const owner = blocks.find(([el]) => el === target.anchor || el.contains(target.anchor))?.[0] ?? visibleBlock;
         this.compact.set(owner, [...this.compact.get(owner) ?? [], card]);
@@ -9551,12 +9836,8 @@ var ReadingSummaries = class {
     const rect = host.getBoundingClientRect();
     this.root.classList.add("is-measuring");
     this.root.style.removeProperty("height");
-    const identity = `${this.currentPath}:${artifact.source_sha256}`;
-    if (identity !== this.cardIdentity) {
-      this.railCards.clear();
-      this.cardIdentity = identity;
-    }
-    const elements = reconcileSummaryCards(this.root, this.railCards, targets, this.manager.renderOptions);
+    const elements = reconcileSummaryCards(this.root, this.railCards, targets, this.manager.renderOptions, (key) => this.manager.cardState(this.currentPath, key));
+    for (const element2 of elements) element2.classList.remove("va-summary-compact");
     observeCards(this.observer, this.observedCards, elements);
     const laidOut = targets.map((target, index) => ({
       card: elements[index],
@@ -9618,16 +9899,17 @@ function knowledgeMetadataExtension() {
 }
 var summaryEffect = import_state.StateEffect.define();
 var SummaryWidget = class extends import_view.WidgetType {
-  constructor(title, summary, status2 = false, renderOptions) {
+  constructor(title, summary, status2 = false, renderOptions, expansion) {
     super();
     this.title = title;
     this.summary = summary;
     this.status = status2;
     this.renderOptions = renderOptions;
+    this.expansion = expansion;
     this.renderRevision = renderOptions?.revision;
   }
   eq(other) {
-    return this.title === other.title && this.summary === other.summary && this.status === other.status && this.renderOptions === other.renderOptions && this.renderRevision === other.renderRevision;
+    return this.title === other.title && this.summary === other.summary && this.status === other.status && this.renderOptions === other.renderOptions && this.renderRevision === other.renderRevision && this.expansion === other.expansion;
   }
   toDOM(view) {
     const element2 = this.status ? (() => {
@@ -9635,7 +9917,7 @@ var SummaryWidget = class extends import_view.WidgetType {
       el.className = "va-summary-status";
       el.textContent = this.summary;
       return el;
-    })() : summaryCard(view.dom.ownerDocument, this.title, this.summary, true, this.renderOptions);
+    })() : summaryCard(view.dom.ownerDocument, this.title, this.summary, true, this.renderOptions, this.expansion);
     element2.addEventListener("va-summary-resize", () => view.requestMeasure());
     element2.classList.add("va-summary-widget");
     element2.setAttribute("contenteditable", "false");
@@ -9655,9 +9937,9 @@ var summaryField = import_state.StateField.define({
         value = import_view.Decoration.none;
         continue;
       }
-      const widgets = state.artifact ? cards(state.artifact).filter((card) => card.line <= transaction.state.doc.lines).map((card, index) => {
+      const widgets = state.artifact ? cards(state.artifact, transaction.state.doc.toString()).filter((card) => card.line <= transaction.state.doc.lines).map((card, index) => {
         const position = index === 0 ? 0 : transaction.state.doc.line(card.line).to;
-        return import_view.Decoration.widget({ widget: new SummaryWidget(state.display(card.title), displayChineseMarkdown(card.summary, state.display), false, state.renderOptions), block: true, side: index === 0 ? -1 : 1 }).range(position);
+        return import_view.Decoration.widget({ widget: new SummaryWidget(state.display(card.title), displayChineseMarkdown(card.summary, state.display), false, state.renderOptions, state.stateFor(card.key)), block: true, side: index === 0 ? -1 : 1 }).range(position);
       }) : [import_view.Decoration.widget({ widget: new SummaryWidget("", state.display(statusLabel(state.status)), true), block: true, side: -1 }).range(0)];
       value = import_view.Decoration.set(widgets, true);
     }
@@ -9724,14 +10006,18 @@ var EditorSummaries = class {
       const result = path ? await this.manager.load(path, text4) : { artifact: null, status: "disabled" };
       if (!this.alive || revision !== this.revision || path !== this.path() || text4 !== this.view.state.doc.toString() || this.view.composing) return;
       this.result = result;
-      this.compact = this.view.dom.clientWidth < MIN_WIDE;
+      this.compact = !usesRail(this.view.dom);
       const enabled = result.status !== "disabled";
+      if (!enabled) {
+        this.railCards.clear();
+        this.cardIdentity = "";
+      }
       this.view.dom.classList.toggle("va-summary-enabled", enabled);
       this.view.dom.classList.toggle("va-summary-wide", enabled && !this.compact);
       const next = JSON.stringify([result, this.compact, this.manager.displayVersion]);
       if (next !== this.signature) {
         this.signature = next;
-        this.view.dispatch({ effects: summaryEffect.of({ ...result, compact: this.compact, display: this.manager.displayText, renderOptions: this.manager.renderOptions }) });
+        this.view.dispatch({ effects: summaryEffect.of({ ...result, compact: this.compact, display: this.manager.displayText, renderOptions: this.manager.renderOptions, stateFor: (key) => this.manager.cardState(path ?? "", key) }) });
       }
       this.measure();
     } catch {
@@ -9749,12 +10035,12 @@ var EditorSummaries = class {
         if (this.compact || this.result.status === "disabled") return [];
         const rect = view.dom.getBoundingClientRect();
         if (!this.result.artifact) return [{ key: "status", top: 12, height: 30, title: "", summary: this.result.status, status: true }];
-        const identity = `${this.path()}:${this.result.artifact.source_sha256}`;
+        const identity = this.path() ?? "";
         if (identity !== this.cardIdentity) {
           this.railCards.clear();
           this.cardIdentity = identity;
         }
-        return this.manager.displayCards(this.result.artifact).flatMap((card, index) => {
+        return this.manager.displayCards(this.result.artifact, view.state.doc.toString()).flatMap((card, index) => {
           if (card.line > view.state.doc.lines) return [];
           const position = index === 0 ? 0 : view.state.doc.line(card.line).from;
           if (!view.visibleRanges.some((range) => position >= range.from && position <= range.to)) return [];
@@ -9779,7 +10065,7 @@ var EditorSummaries = class {
           observeCards(this.observer, this.observedCards, []);
           return;
         }
-        const elements = reconcileSummaryCards(this.root, this.railCards, items, this.manager.renderOptions);
+        const elements = reconcileSummaryCards(this.root, this.railCards, items, this.manager.renderOptions, (key) => this.manager.cardState(this.path() ?? "", key));
         observeCards(this.observer, this.observedCards, elements);
         const positions = packSummaryCards(items);
         for (let i2 = 0; i2 < elements.length; i2++) elements[i2].style.top = `${positions[i2]}px`;
@@ -9826,6 +10112,44 @@ function errorText(error2, undo = false) {
   if (error2 instanceof ApiError && error2.status === 409) return undo ? "\u7B14\u8BB0\u5728\u81EA\u52A8\u4FEE\u6539\u540E\u5DF2\u6709\u53D8\u5316\uFF0C\u6216\u6279\u6B21\u5DF2\u5904\u7406\u3002\u64A4\u9500\u672A\u83B7\u786E\u8BA4\uFF0C\u8BF7\u5237\u65B0\u6279\u6B21\u67E5\u770B\u7ED3\u679C\u3002" : "\u540E\u53F0\u8BBE\u7F6E\u5DF2\u88AB\u5176\u4ED6\u8BBE\u5907\u66F4\u65B0\uFF0C\u8BF7\u91CD\u65B0\u52A0\u8F7D\u540E\u4FDD\u5B58\u3002";
   return error2 instanceof ApiError ? error2.message : "\u64CD\u4F5C\u672A\u5B8C\u6210\uFF0C\u8BF7\u5237\u65B0\u540E\u91CD\u8BD5\u3002";
 }
+function count(value) {
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0 ? value : 0;
+}
+function localTime(value) {
+  if (typeof value !== "string" || value.length > 80) return null;
+  const date = new Date(value);
+  return Number.isFinite(date.getTime()) ? date.toLocaleString() : null;
+}
+function renderAutomationStatus(parent, status2, enabled, connectionError = "", policyChanged = false) {
+  parent.empty();
+  parent.setAttribute("role", "status");
+  parent.setAttribute("aria-live", "polite");
+  const error2 = typeof status2.error === "string" ? status2.error.slice(0, 600).trim() : "";
+  const state = typeof status2.state === "string" && ["idle", "queued", "running", "scanning", "failed", "disabled"].includes(status2.state) ? status2.state : !enabled ? "disabled" : error2 || count(status2.failed) ? "failed" : status2.running ? "running" : count(status2.pending) || count(status2.refreshing) || status2.scanning_partial ? "queued" : "idle";
+  parent.dataset.state = state;
+  const label2 = { idle: "\u7A7A\u95F2", queued: "\u6392\u961F\u7B49\u5F85", running: "\u540E\u53F0\u5904\u7406\u4E2D", scanning: "\u6B63\u5728\u626B\u63CF", failed: "\u9700\u8981\u5904\u7406", disabled: "\u5DF2\u505C\u7528" }[state];
+  const qualifiers = [status2.scanning || status2.scanning_partial ? "\u626B\u63CF\u5C1A\u672A\u5B8C\u6210" : "", count(status2.partial) ? "\u6458\u8981\u90E8\u5206\u5B8C\u6210" : "", count(status2.refreshing) ? "\u6458\u8981\u66F4\u65B0\u4E2D" : ""].filter(Boolean);
+  parent.createEl("p", { text: `\u540E\u53F0\u72B6\u6001\uFF1A${label2}${qualifiers.length ? ` \xB7 ${qualifiers.join(" \xB7 ")}` : ""}` });
+  parent.createEl("p", { text: `\u5DF2\u53D1\u73B0 ${count(status2.notes)} \u7BC7 \xB7 \u6458\u8981\u5B8C\u6210 ${count(status2.summaries)} \u7BC7 \xB7 \u90E8\u5206\u5B8C\u6210 ${count(status2.partial)} \u7BC7 \xB7 \u9700\u91CD\u8BD5 ${count(status2.failed)} \u7BC7 \xB7 \u5F85\u5904\u7406 ${count(status2.pending)} \u7BC7 \xB7 \u66F4\u65B0\u4E2D ${count(status2.refreshing)} \u7BC7`, cls: "va-muted" });
+  const checked = localTime(status2.last_checked);
+  if (checked) parent.createEl("p", { text: `\u4E0A\u6B21\u68C0\u67E5\uFF1A${checked}`, cls: "va-muted" });
+  if (error2) parent.createEl("p", { text: `\u540E\u53F0\u672A\u5B8C\u6210\uFF1A${error2}`, cls: "va-error" });
+  const registry = record2(status2.registry);
+  if (Object.keys(registry).length) {
+    const registryLabel = { building: "\u6B63\u5728\u6784\u5EFA", ready: "\u5DF2\u5C31\u7EEA", capacity: "\u8FBE\u5230\u5BB9\u91CF\u9650\u5236", partial: "\u5C1A\u672A\u5B8C\u6210" }[String(registry.status)] ?? "\u7B49\u5F85\u68C0\u67E5";
+    parent.createEl("p", { text: `\u77E5\u8BC6\u7D22\u5F15\uFF1A${registryLabel} \xB7 \u5DF2\u7D22\u5F15 ${count(registry.indexed)} / ${count(registry.total)} \u7BC7 \xB7 \u5269\u4F59 ${count(registry.remaining)} \u7BC7`, cls: "va-muted" });
+    if (typeof registry.error === "string" && registry.error.trim()) parent.createEl("p", { text: `\u77E5\u8BC6\u7D22\u5F15\u672A\u5B8C\u6210\uFF1A${registry.error.slice(0, 600)}`, cls: "va-error" });
+    if (registry.status === "capacity") parent.createEl("p", { text: "\u77E5\u8BC6\u7D22\u5F15\u8FBE\u5230\u5F53\u524D\u5BB9\u91CF\uFF1B\u6574\u7406\u65E0\u5173\u7B14\u8BB0\u6216\u8054\u7CFB\u7BA1\u7406\u5458\u6269\u5C55\u5BB9\u91CF\u540E\u91CD\u8BD5\u3002\u6B64\u9650\u5236\u53EA\u5F71\u54CD\u77E5\u8BC6\u5173\u8054\u7D22\u5F15\u3002", cls: "va-muted" });
+  }
+  if (typeof status2.next_retry_at === "number" && status2.next_retry_at > 0 && Number.isFinite(status2.next_retry_at)) {
+    const retry = new Date(status2.next_retry_at * 1e3);
+    if (Number.isFinite(retry.getTime())) parent.createEl("p", { text: `\u4E0B\u6B21\u540E\u53F0\u68C0\u67E5\uFF1A${retry.toLocaleString()}`, cls: "va-muted" });
+  }
+  if (error2 || count(status2.failed)) parent.createEl("p", { text: "\u53EF\u70B9\u51FB\u201C\u68C0\u67E5\u5DF2\u4FDD\u5B58\u7B14\u8BB0\u201D\u91CD\u8BD5\uFF1B\u82E5\u4ECD\u672A\u5B8C\u6210\uFF0C\u8BF7\u68C0\u67E5\u52A9\u624B\u8FDE\u63A5\u6216\u8C03\u6574\u6E90\u7B14\u8BB0\u8303\u56F4\u3002", cls: "va-muted" });
+  if (status2.scanning || status2.scanning_partial) parent.createEl("p", { text: "\u6B63\u5728\u5206\u6279\u53D1\u73B0\u7B14\u8BB0\uFF0C\u5C1A\u672A\u626B\u63CF\u7684\u7B14\u8BB0\u4F1A\u5728\u540E\u7EED\u68C0\u67E5\u4E2D\u7EE7\u7EED\u5904\u7406\u3002", cls: "va-muted" });
+  if (connectionError) parent.createEl("p", { text: `\u72B6\u6001\u66F4\u65B0\u672A\u5B8C\u6210\uFF1A${connectionError} \u5C06\u81EA\u52A8\u91CD\u8BD5\uFF0C\u4E5F\u53EF\u70B9\u51FB\u201C\u5237\u65B0\u540E\u53F0\u72B6\u6001\u201D\u3002`, cls: "va-error" });
+  if (policyChanged) parent.createEl("p", { text: "\u5176\u4ED6\u8BBE\u5907\u5DF2\u66F4\u65B0\u8BBE\u7F6E\u3002\u4F60\u7684\u672A\u4FDD\u5B58\u8F93\u5165\u5DF2\u4FDD\u7559\uFF1B\u4FDD\u5B58\u524D\u8BF7\u91CD\u65B0\u52A0\u8F7D\u8BBE\u7F6E\u3002", cls: "va-error" });
+}
 var AutomationSettingsModal = class extends import_obsidian4.Modal {
   constructor(app, controller, changed) {
     super(app);
@@ -9833,6 +10157,13 @@ var AutomationSettingsModal = class extends import_obsidian4.Modal {
     this.changed = changed;
     this.alive = false;
     this.stop = null;
+    this.poll = null;
+    this.revision = 0;
+    this.statusEl = null;
+    this.status = {};
+    this.policy = null;
+    this.policyChanged = false;
+    this.statusRequest = 0;
     this.bindingScope = controller.sessionKey();
   }
   current() {
@@ -9843,23 +10174,71 @@ var AutomationSettingsModal = class extends import_obsidian4.Modal {
     this.modalEl.addClass("va-automation-modal");
     this.titleEl.setText("\u81EA\u52A8\u6458\u8981\u4E0E\u77E5\u8BC6\u7F51\u7EDC");
     this.stop = this.controller.subscribePassive(() => {
-      if (this.alive && this.bindingScope !== this.controller.sessionKey()) this.contentEl.setText("\u52A9\u624B\u7ED1\u5B9A\u5DF2\u53D8\u5316\uFF0C\u8BF7\u5173\u95ED\u540E\u91CD\u65B0\u6253\u5F00\u3002");
+      if (this.alive && this.bindingScope !== this.controller.sessionKey()) {
+        this.cancelPoll();
+        this.revision++;
+        this.contentEl.setText("\u52A9\u624B\u7ED1\u5B9A\u5DF2\u53D8\u5316\uFF0C\u8BF7\u5173\u95ED\u540E\u91CD\u65B0\u6253\u5F00\u3002");
+      }
     });
     void this.load();
   }
+  cancelPoll() {
+    if (this.poll) clearTimeout(this.poll);
+    this.poll = null;
+  }
+  schedulePoll() {
+    this.cancelPoll();
+    if (!this.current()) return;
+    const busy = this.status.running || this.status.scanning || this.status.scanning_partial || count(this.status.pending) || count(this.status.refreshing) || record2(this.status.registry).status === "building";
+    this.poll = setTimeout(() => {
+      this.poll = null;
+      void this.refreshStatus();
+    }, busy ? 5e3 : 15e3);
+  }
+  async refreshStatus() {
+    this.cancelPoll();
+    const revision = this.revision, request = ++this.statusRequest;
+    try {
+      const response = record2(await this.controller.requestAutomation("/policy", "GET", void 0, void 0, true));
+      if (!this.current() || request !== this.statusRequest || revision !== this.revision || !this.statusEl || !this.policy) return;
+      const policy = parsePolicy(response.policy);
+      if (!policy) throw new Error("invalid policy");
+      this.status = record2(response.status);
+      this.policyChanged = policy.version !== this.policy.version;
+      renderAutomationStatus(this.statusEl, this.status, policy.enabled, "", this.policyChanged);
+    } catch (error2) {
+      if (this.current() && request === this.statusRequest && revision === this.revision && this.statusEl && this.policy)
+        renderAutomationStatus(this.statusEl, this.status, this.policy.enabled, errorText(error2), this.policyChanged);
+    } finally {
+      if (this.current() && request === this.statusRequest && revision === this.revision) this.schedulePoll();
+    }
+  }
   async load() {
+    this.cancelPoll();
+    const revision = ++this.revision;
     this.contentEl.setText("\u6B63\u5728\u52A0\u8F7D\u540E\u53F0\u8BBE\u7F6E\u2026");
     try {
       const response = record2(await this.controller.requestAutomation("/policy"));
-      if (!this.current()) return;
+      if (!this.current() || revision !== this.revision) return;
       const policy = parsePolicy(response.policy);
       if (!policy) throw new Error("invalid policy");
       this.render(policy, record2(response.status));
     } catch (error2) {
-      if (this.current()) this.contentEl.setText(errorText(error2));
+      if (this.current() && revision === this.revision) {
+        this.contentEl.setText(errorText(error2));
+        const retry = this.contentEl.createEl("button", { text: "\u91CD\u65B0\u52A0\u8F7D", type: "button" });
+        retry.onclick = () => {
+          if (this.current()) void this.load();
+        };
+      }
     }
   }
   render(policy, status2 = {}) {
+    this.cancelPoll();
+    this.revision++;
+    this.policy = policy;
+    this.status = status2;
+    this.policyChanged = false;
     this.contentEl.empty();
     this.contentEl.createEl("p", { text: "\u540E\u53F0\u5728\u7B14\u8BB0\u4FDD\u5B58\u5E76\u7A33\u5B9A\u540E\uFF0C\u63D0\u70BC\u503C\u5F97\u72EC\u7ACB\u9605\u8BFB\u7684\u4E3B\u9898\uFF0C\u8FDE\u63A5\u5DF2\u6709\u7B14\u8BB0\uFF0C\u5E76\u5728\u9700\u8981\u65F6\u8865\u5145\u77E5\u8BC6\u9875\u3002\u65B0\u77E5\u8BC6\u9875\u6CE8\u660E\u6765\u6E90\uFF0C\u539F\u59CB\u7B14\u8BB0\u4E0E\u76F8\u5173\u77E5\u8BC6\u901A\u8FC7\u94FE\u63A5\u76F8\u8FDE\u3002\u6458\u8981\u53EA\u663E\u793A\u5728\u539F\u6587\u65C1\uFF0C\u81EA\u52A8\u4FEE\u6539\u53EF\u67E5\u770B\u6216\u64A4\u9500\u3002", cls: "va-muted" });
     const draft = { ...policy };
@@ -9893,9 +10272,8 @@ var AutomationSettingsModal = class extends import_obsidian4.Modal {
     }));
     updateFolder();
     this.contentEl.createEl("p", { text: `\u4FDD\u5B58\u540E\u9759\u7F6E\u7EA6 ${policy.quiet_seconds} \u79D2\u8FDB\u5165\u4F4E\u4F18\u5148\u961F\u5217\u3002\u524D\u53F0\u63D0\u95EE\u4F18\u5148\u3002`, cls: "va-muted" });
-    const count = (value) => typeof value === "number" && Number.isSafeInteger(value) && value >= 0 ? value : 0;
-    this.contentEl.createEl("p", { text: `${status2.running ? "\u540E\u53F0\u5904\u7406\u4E2D \xB7 " : ""}\u5DF2\u53D1\u73B0 ${count(status2.notes)} \u7BC7 \xB7 \u6458\u8981\u5B8C\u6210 ${count(status2.summaries)} \u7BC7 \xB7 \u90E8\u5206\u5B8C\u6210 ${count(status2.partial)} \u7BC7 \xB7 \u9700\u91CD\u8BD5 ${count(status2.failed)} \u7BC7`, cls: "va-muted" });
-    if (typeof status2.last_checked === "string" && status2.last_checked.length <= 80) this.contentEl.createEl("p", { text: `\u4E0A\u6B21\u68C0\u67E5\uFF1A${status2.last_checked}`, cls: "va-muted" });
+    this.statusEl = this.contentEl.createDiv({ cls: "va-automation-status" });
+    renderAutomationStatus(this.statusEl, status2, policy.enabled);
     const error2 = this.contentEl.createEl("p", { cls: "va-error", attr: { role: "alert" } });
     error2.hidden = true;
     const actions = this.contentEl.createDiv({ cls: "va-automation-actions" });
@@ -9903,7 +10281,11 @@ var AutomationSettingsModal = class extends import_obsidian4.Modal {
     history.onclick = () => {
       if (this.current()) new AutomationHistoryModal(this.app, this.controller, this.changed).open();
     };
-    const reload = actions.createEl("button", { text: "\u91CD\u65B0\u52A0\u8F7D", type: "button" });
+    const refresh = actions.createEl("button", { text: "\u5237\u65B0\u540E\u53F0\u72B6\u6001", type: "button" });
+    refresh.onclick = () => {
+      if (this.current()) void this.refreshStatus();
+    };
+    const reload = actions.createEl("button", { text: "\u91CD\u65B0\u52A0\u8F7D\u8BBE\u7F6E", type: "button" });
     reload.onclick = () => {
       if (this.current()) void this.load();
     };
@@ -9917,6 +10299,7 @@ var AutomationSettingsModal = class extends import_obsidian4.Modal {
           error2.textContent = "\u5DF2\u63D0\u4EA4\u540E\u53F0\u68C0\u67E5\uFF1B\u6458\u8981\u4F1A\u5728\u5B8C\u6210\u540E\u81EA\u52A8\u66F4\u65B0\u3002";
           error2.hidden = false;
           this.changed();
+          void this.refreshStatus();
         }
       }).catch((cause) => {
         if (this.current()) {
@@ -9930,6 +10313,13 @@ var AutomationSettingsModal = class extends import_obsidian4.Modal {
     const save = actions.createEl("button", { text: "\u4FDD\u5B58\u8BBE\u7F6E", type: "button", cls: "mod-cta" });
     save.onclick = () => {
       if (!this.current() || save.disabled) return;
+      if (this.policyChanged) {
+        error2.textContent = "\u8BBE\u7F6E\u5DF2\u88AB\u5176\u4ED6\u8BBE\u5907\u66F4\u65B0\uFF0C\u8BF7\u91CD\u65B0\u52A0\u8F7D\u8BBE\u7F6E\u540E\u4FDD\u5B58\u3002\u4F60\u7684\u8F93\u5165\u4ECD\u4FDD\u7559\u5728\u6B64\u5904\u3002";
+        error2.hidden = false;
+        return;
+      }
+      this.cancelPoll();
+      const revision = ++this.revision;
       const prefix = (value) => {
         const clean = value.trim();
         return clean && !clean.endsWith("/") ? `${clean}/` : clean;
@@ -9938,18 +10328,20 @@ var AutomationSettingsModal = class extends import_obsidian4.Modal {
       if (placement === "folder" && !next.concept_prefix) {
         error2.textContent = "\u8BF7\u9009\u62E9\u77E5\u8BC6\u9875\u4FDD\u5B58\u76EE\u5F55\uFF0C\u6216\u9009\u62E9\u201C\u4E0E\u539F\u7B14\u8BB0\u540C\u76EE\u5F55\u201D\u3002";
         error2.hidden = false;
+        this.schedulePoll();
         return;
       }
       if (!safePrefix(next.source_prefix) || !safePrefix(next.concept_prefix)) {
         error2.textContent = "\u8BF7\u8F93\u5165\u6709\u6548\u7684 Vault \u5185\u76F8\u5BF9\u76EE\u5F55\uFF0C\u4E0D\u80FD\u4F7F\u7528\u9690\u85CF\u76EE\u5F55\u3001.. \u6216\u7EDD\u5BF9\u8DEF\u5F84\u3002";
         error2.hidden = false;
+        this.schedulePoll();
         return;
       }
       save.disabled = true;
       reload.disabled = true;
       error2.hidden = true;
       void this.controller.requestAutomation("/policy", "POST", next).then((response) => {
-        if (!this.current()) return;
+        if (!this.current() || revision !== this.revision) return;
         const updated = parsePolicy(record2(response).policy);
         if (!updated) throw new Error("invalid policy");
         this.changed();
@@ -9963,14 +10355,19 @@ var AutomationSettingsModal = class extends import_obsidian4.Modal {
         if (this.current()) {
           save.disabled = false;
           reload.disabled = false;
+          this.schedulePoll();
         }
       });
     };
+    this.schedulePoll();
   }
   onClose() {
     this.alive = false;
+    this.revision++;
+    this.cancelPoll();
     this.stop?.();
     this.stop = null;
+    this.statusEl = null;
     this.contentEl.empty();
   }
 };
@@ -9983,6 +10380,12 @@ var AutomationHistoryModal = class extends import_obsidian4.Modal {
     this.stop = null;
     this.poll = null;
     this.revision = 0;
+    this.batches = [];
+    this.nextCursor = null;
+    this.sourcePath = "";
+    this.listView = null;
+    this.listScroll = 0;
+    this.openedBatch = "";
     this.bindingScope = controller.sessionKey();
   }
   current(revision = this.revision) {
@@ -9997,37 +10400,138 @@ var AutomationHistoryModal = class extends import_obsidian4.Modal {
       if (this.alive && this.bindingScope !== this.controller.sessionKey()) this.contentEl.setText("\u52A9\u624B\u7ED1\u5B9A\u5DF2\u53D8\u5316\uFF0C\u8BF7\u5173\u95ED\u540E\u91CD\u65B0\u6253\u5F00\u3002");
     });
   }
-  async list() {
+  showList() {
+    if (!this.current()) return;
     if (this.poll) clearTimeout(this.poll);
     this.poll = null;
-    const revision = ++this.revision;
-    this.contentEl.setText("\u6B63\u5728\u52A0\u8F7D\u53D8\u66F4\u5386\u53F2\u2026");
+    this.revision++;
+    if (!this.listView) {
+      void this.list();
+      return;
+    }
+    this.contentEl.replaceChildren(this.listView);
+    this.contentEl.scrollTop = this.listScroll;
+    const button = Array.from(this.listView.querySelectorAll("[data-batch-id]")).find((element2) => element2.dataset.batchId === this.openedBatch)?.querySelector("button");
+    button?.focus({ preventScroll: true });
+  }
+  async list(reset = true) {
+    if (this.poll) clearTimeout(this.poll);
+    this.poll = null;
+    const revision = ++this.revision, scroll = reset ? 0 : this.contentEl.scrollTop;
+    if (reset) {
+      this.batches = [];
+      this.nextCursor = null;
+      this.listView = null;
+      this.contentEl.setText("\u6B63\u5728\u52A0\u8F7D\u53D8\u66F4\u5386\u53F2\u2026");
+    }
+    const pending = this.listView?.querySelector(".va-automation-load-more");
+    if (pending) {
+      pending.disabled = true;
+      pending.textContent = "\u6B63\u5728\u52A0\u8F7D\u2026";
+    }
     try {
-      const response = record2(await this.controller.requestAutomation("/batches"));
+      const query = { limit: "50" };
+      if (!reset && this.nextCursor) query.cursor = this.nextCursor;
+      if (this.sourcePath) query.source_path = this.sourcePath;
+      const response = record2(await this.controller.requestAutomation("/batches", "GET", void 0, query));
       if (!this.current(revision)) return;
-      if (!Array.isArray(response.batches)) throw new Error("invalid batches");
-      const batches = response.batches.slice(0, 200).map(parseBatch);
-      if (batches.some((batch) => !batch)) throw new Error("invalid batch");
-      this.contentEl.empty();
-      const refresh = this.contentEl.createEl("button", { text: "\u5237\u65B0\u5386\u53F2", type: "button" });
-      refresh.onclick = () => {
-        void this.list();
-      };
-      if (!batches.length) this.contentEl.createEl("p", { text: "\u8FD8\u6CA1\u6709\u81EA\u52A8\u6982\u5FF5\u4FEE\u6539\u3002" });
-      for (const batch of batches) {
-        const row = this.contentEl.createDiv({ cls: "va-automation-batch" });
-        row.createEl("p", { text: `${batch.source_path} \xB7 ${batchStatus(batch.status)}`, cls: "va-automation-batch-title" });
-        row.createEl("p", { text: `${batch.created_at} \xB7 ${batch.concepts.map((concept) => concept.name).join("\u3001") || "\u672A\u521B\u5EFA\u6982\u5FF5"}`, cls: "va-muted" });
-        const open = row.createEl("button", { text: "\u67E5\u770B\u5DEE\u5F02", type: "button" });
-        open.onclick = () => {
-          void this.detail(batch.id);
-        };
+      if (!Array.isArray(response.batches) || response.batches.length > 200 || response.next_cursor != null && (typeof response.next_cursor !== "string" || !response.next_cursor || response.next_cursor.length > 4096)) throw new Error("invalid batches");
+      const batches = response.batches.map(parseBatch);
+      if (batches.some((batch) => !batch) || response.next_cursor && response.next_cursor === query.cursor) throw new Error("invalid batch");
+      const known = new Set(this.batches.map((batch) => batch.id));
+      for (const batch of batches) if (!known.has(batch.id)) {
+        this.batches.push(batch);
+        known.add(batch.id);
       }
+      this.nextCursor = typeof response.next_cursor === "string" ? response.next_cursor : null;
+      this.renderList();
+      this.contentEl.scrollTop = scroll;
+      if (!reset) (this.listView?.querySelector(".va-automation-load-more") ?? this.listView?.querySelector(".va-automation-history-count"))?.focus({ preventScroll: true });
     } catch (error2) {
-      if (this.current(revision)) this.contentEl.setText(errorText(error2));
+      if (this.current(revision)) {
+        if (this.listView) {
+          this.contentEl.replaceChildren(this.listView);
+          const status2 = this.listView.querySelector(".va-automation-history-pages");
+          status2.createEl("p", { text: errorText(error2), cls: "va-error", attr: { role: "alert" } });
+          if (pending) {
+            pending.disabled = false;
+            pending.textContent = "\u91CD\u8BD5\u52A0\u8F7D\u66F4\u65E9\u8BB0\u5F55";
+          }
+        } else {
+          this.contentEl.setText(errorText(error2));
+          const retry = this.contentEl.createEl("button", { text: "\u91CD\u8BD5\u52A0\u8F7D\u5386\u53F2", type: "button" });
+          retry.onclick = () => {
+            if (this.current()) void this.list();
+          };
+        }
+      }
+    }
+  }
+  renderList() {
+    const view = this.contentEl.ownerDocument.createElement("div");
+    this.listView = view;
+    this.contentEl.replaceChildren(view);
+    const refresh = view.createEl("button", { text: "\u5237\u65B0\u5386\u53F2", type: "button" });
+    refresh.onclick = () => {
+      if (this.current()) void this.list();
+    };
+    const filter = view.createDiv({ cls: "va-automation-history-filter" }), input = filter.createEl("input", { type: "text", attr: { "aria-label": "\u6309\u6E90\u7B14\u8BB0\u8DEF\u5F84\u7B5B\u9009", placeholder: "\u6E90\u7B14\u8BB0\u8DEF\u5F84\uFF0C\u4F8B\u5982 \u9879\u76EE/\u7814\u7A76.md" } });
+    input.value = this.sourcePath;
+    const apply = filter.createEl("button", { text: "\u7B5B\u9009", type: "button" });
+    const clear = filter.createEl("button", { text: "\u5168\u90E8\u7B14\u8BB0", type: "button" });
+    const filterError = view.createEl("p", { cls: "va-error", attr: { role: "alert" } });
+    filterError.hidden = true;
+    apply.onclick = () => {
+      const path = input.value.trim();
+      if (path && !safeNotePath(path)) {
+        filterError.textContent = "\u8BF7\u8F93\u5165 Vault \u5185\u5B8C\u6574 Markdown \u7B14\u8BB0\u8DEF\u5F84\u3002";
+        filterError.hidden = false;
+        return;
+      }
+      if (!this.current()) return;
+      this.sourcePath = path;
+      void this.list();
+    };
+    input.onkeydown = (event) => {
+      if (event.key === "Enter") {
+        event.preventDefault();
+        apply.click();
+      }
+    };
+    clear.onclick = () => {
+      if (this.current()) {
+        this.sourcePath = "";
+        void this.list();
+      }
+    };
+    if (!this.batches.length) view.createEl("p", { text: this.sourcePath ? "\u8FD9\u7BC7\u7B14\u8BB0\u8FD8\u6CA1\u6709\u81EA\u52A8\u6982\u5FF5\u4FEE\u6539\u3002" : "\u8FD8\u6CA1\u6709\u81EA\u52A8\u6982\u5FF5\u4FEE\u6539\u3002" });
+    for (const batch of this.batches) {
+      const row = view.createDiv({ cls: "va-automation-batch" });
+      row.dataset.batchId = batch.id;
+      row.createEl("p", { text: `${batch.source_path} \xB7 ${batchStatus(batch.status)}`, cls: "va-automation-batch-title" });
+      row.createEl("p", { text: `${localTime(batch.created_at) ?? "\u65F6\u95F4\u672A\u77E5"} \xB7 ${batch.concepts.map((concept) => concept.name).join("\u3001") || "\u672A\u521B\u5EFA\u6982\u5FF5"}`, cls: "va-muted" });
+      const open = row.createEl("button", { text: "\u67E5\u770B\u5DEE\u5F02", type: "button" });
+      open.onclick = () => {
+        if (this.current()) void this.detail(batch.id);
+      };
+    }
+    const pages = view.createDiv({ cls: "va-automation-history-pages" });
+    pages.createEl("p", { text: `\u5DF2\u52A0\u8F7D ${this.batches.length} \u6279${this.nextCursor ? "\uFF0C\u8FD8\u6709\u66F4\u65E9\u8BB0\u5F55\u3002" : "\uFF0C\u5DF2\u5230\u6700\u65E9\u8BB0\u5F55\u3002"}`, cls: "va-muted va-automation-history-count", attr: { tabindex: "-1" } });
+    if (this.nextCursor) {
+      const more = pages.createEl("button", { text: "\u52A0\u8F7D\u66F4\u65E9\u8BB0\u5F55", type: "button", cls: "va-automation-load-more" });
+      more.onclick = () => {
+        if (this.current() && !more.disabled) void this.list(false);
+      };
     }
   }
   async detail(id) {
+    if (this.listView?.parentElement === this.contentEl) this.listScroll = this.contentEl.scrollTop;
+    this.openedBatch = id;
+    const pending = this.listView?.querySelector(".va-automation-load-more");
+    if (pending) {
+      pending.disabled = false;
+      pending.textContent = "\u52A0\u8F7D\u66F4\u65E9\u8BB0\u5F55";
+    }
     if (this.poll) clearTimeout(this.poll);
     this.poll = null;
     const revision = ++this.revision;
@@ -10039,16 +10543,28 @@ var AutomationHistoryModal = class extends import_obsidian4.Modal {
       if (!batch || batch.id !== id) throw new Error("invalid batch");
       this.show(batch, revision);
     } catch (error2) {
-      if (this.current(revision)) this.contentEl.setText(errorText(error2));
+      if (this.current(revision)) {
+        this.contentEl.setText(errorText(error2));
+        const back = this.contentEl.createEl("button", { text: "\u8FD4\u56DE\u5386\u53F2", type: "button" });
+        back.onclick = () => this.showList();
+        const retry = this.contentEl.createEl("button", { text: "\u91CD\u65B0\u52A0\u8F7D\u6279\u6B21", type: "button" });
+        retry.onclick = () => {
+          if (this.current()) void this.detail(id);
+        };
+      }
     }
   }
   show(batch, revision) {
+    const known = this.batches.findIndex((item) => item.id === batch.id);
+    if (known >= 0) this.batches[known] = batch;
+    const title = Array.from(this.listView?.querySelectorAll("[data-batch-id]") ?? []).find((element2) => element2.dataset.batchId === batch.id)?.querySelector(".va-automation-batch-title");
+    if (title) title.textContent = `${batch.source_path} \xB7 ${batchStatus(batch.status)}`;
     this.contentEl.empty();
+    this.contentEl.scrollTop = 0;
     const back = this.contentEl.createEl("button", { text: "\u8FD4\u56DE\u5386\u53F2", type: "button" });
-    back.onclick = () => {
-      void this.list();
-    };
+    back.onclick = () => this.showList();
     this.contentEl.createEl("p", { text: `${batch.source_path} \xB7 ${batchStatus(batch.status)}` });
+    if (batch.error) this.contentEl.createEl("p", { text: `\u6B64\u6279\u6B21\u672A\u5B8C\u6210\uFF1A${batch.error}`, cls: "va-error" });
     this.contentEl.createEl("p", { text: "\u64A4\u9500\u4F1A\u6838\u5BF9\u5F53\u524D\u7248\u672C\uFF1B\u6765\u6E90\u7B14\u8BB0\u5DF2\u6709\u4EBA\u5DE5\u6539\u52A8\u65F6\u4F1A\u505C\u6B62\uFF0C\u907F\u514D\u8986\u76D6\u65B0\u5185\u5BB9\u3002\u6982\u5FF5\u9875\u5DF2\u6709\u540E\u7EED\u4FEE\u6539\u3001\u521B\u5EFA\u6216\u5176\u4ED6\u7B14\u8BB0\u5F15\u7528\u65F6\u4F1A\u4FDD\u7559\u3002", cls: "va-muted" });
     for (const item of batch.retained ?? []) {
       const reason = item.reason === "changed" ? "\u5DF2\u88AB\u540E\u7EED\u4FEE\u6539\u6216\u521B\u5EFA\uFF0C\u672A\u5220\u9664\u3002" : item.reason === "referenced" ? "\u4ECD\u6709\u5176\u4ED6\u7B14\u8BB0\u5F15\u7528\u3002" : "\u672C\u6B21\u64A4\u9500\u4FDD\u7559\u6B64\u6982\u5FF5\u9875\u3002";
@@ -10112,6 +10628,8 @@ var AutomationHistoryModal = class extends import_obsidian4.Modal {
     this.poll = null;
     this.stop?.();
     this.stop = null;
+    this.listView = null;
+    this.batches = [];
     this.contentEl.empty();
   }
 };
@@ -10847,6 +11365,38 @@ var VaultAssistantPlugin = class extends import_obsidian8.Plugin {
     if (!current()) return false;
     const sha2562 = Array.from(new Uint8Array(digest), (value) => value.toString(16).padStart(2, "0")).join("");
     return controller.setDagContext({ path: file.path, ...passage, sha256: sha2562 });
+  }
+  async verifyDagSource(jobId) {
+    const controller = this.controller, draft = validateDagDraft(controller.state.jobs[jobId]?.metadata?.dag);
+    const session = controller.sessionKey(), chat = controller.state.chat?.id;
+    if (!draft || !chat) return false;
+    const current = () => session === controller.sessionKey() && chat === controller.state.chat?.id && controller.state.jobs[jobId]?.status === "completed";
+    const file = this.app.vault.getAbstractFileByPath(draft.source.path);
+    if (!(file instanceof import_obsidian8.TFile) || !safeNotePath(file.path)) {
+      new import_obsidian8.Notice("\u8FD9\u5F20 DAG \u7684\u6765\u6E90\u7B14\u8BB0\u5DF2\u4E0D\u5B58\u5728\uFF0C\u8BF7\u91CD\u65B0\u9009\u62E9\u539F\u6587\u751F\u6210\u3002");
+      return false;
+    }
+    try {
+      const raw = await this.app.vault.read(file);
+      if (!current()) return false;
+      const active = this.app.workspace.getActiveViewOfType(import_obsidian8.MarkdownView);
+      if (active?.file?.path === file.path && active.editor.getValue().replace(/\r\n/g, "\n") !== raw.replace(/\r\n/g, "\n")) {
+        new import_obsidian8.Notice("\u6765\u6E90\u7B14\u8BB0\u6B63\u5728\u4FDD\u5B58\uFF0C\u8BF7\u4FDD\u5B58\u5E76\u540C\u6B65\u540E\u91CD\u65B0\u9009\u62E9\u539F\u6587\u3002");
+        return false;
+      }
+      const bytes = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(raw));
+      if (!current()) return false;
+      const hash = Array.from(new Uint8Array(bytes), (value) => value.toString(16).padStart(2, "0")).join("");
+      const lines = raw.match(/.*?(?:\r\n|[\n\r\v\f\x1c-\x1e\x85\u2028\u2029]|$)/gs)?.filter(Boolean) ?? [];
+      if (hash !== draft.source.sha256 || lines.slice(draft.source.start_line - 1, draft.source.end_line).join("") !== draft.source.excerpt) {
+        new import_obsidian8.Notice("\u8FD9\u5F20 DAG \u7684\u6765\u6E90\u7248\u672C\u5DF2\u53D8\u5316\uFF0C\u8BF7\u91CD\u65B0\u9009\u62E9\u539F\u6587\u751F\u6210\u3002");
+        return false;
+      }
+      return true;
+    } catch {
+      if (current()) new import_obsidian8.Notice("\u6682\u65F6\u65E0\u6CD5\u6838\u5BF9 DAG \u6765\u6E90\uFF0C\u8BF7\u91CD\u65B0\u9009\u62E9\u539F\u6587\u540E\u91CD\u8BD5\u3002");
+      return false;
+    }
   }
   openDag(jobId) {
     const controller = this.controller, draft = validateDagDraft(controller.state.jobs[jobId]?.metadata?.dag);

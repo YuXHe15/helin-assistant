@@ -1,4 +1,4 @@
-# Helin Assistant 0.4.11
+# Helin Assistant 0.4.12
 
 在 Obsidian 原文旁阅读短摘要，在后台连接已有知识、补充必要的知识页，并查看或安全撤销自动修改。支持简繁显示和摘要内公式、代码排版。
 
@@ -10,12 +10,15 @@ Read concise AI summaries beside your Obsidian notes. Connect related knowledge 
 
 ## 功能 / Features
 
-- **原文旁摘要**：后台生成全文与 `#` / `##` 章节摘要，优先使用简短要点或小表格。宽窗口显示右侧摘要带，窄窗口在标题附近折叠显示；摘要不写入 Markdown。结果须与本地已保存版本匹配。
+- **原文旁摘要**：后台生成全文与 `#` / `##` 章节摘要，优先使用简短要点或小表格。根据阅读区的可用宽度显示右侧摘要带；窄窗口在标题附近保留短预览，可展开全文。简繁切换、调整宽度与摘要更新会保留展开状态；摘要不写入 Markdown，结果须与本地已保存版本匹配。
 - **知识联系**：默认优先复用已有笔记，仅在原文依据足够时补充独立知识页，并在准确位置添加 `[[链接]]`。新页默认与原笔记同目录，保留来源；允许不提取，不递归拆分生成页。
 - **查看变更与撤销**：自动知识维护默认关闭，需明确开启；开启后按保存的目录和权限后台写入，无需逐条确认。可查看每批 diff 和修改前后全文。撤销会核对版本，保留后续已修改或被引用的知识页，可能显示部分撤销。
 - **简繁显示**：角落的“简 / 繁”按钮只转换阅读视图、Live Preview 与 AI 摘要的显示，记住本设备、本 Vault 的选择。代码、公式、属性、链接目标及原文件保持原样；Live Preview 当前编辑行显示原文。
 - **公式与代码**：摘要支持 `$…$`、`$$…$$`、`\(…\)`、`\[…\]`、行内代码及代码围栏。使用 Obsidian 自带 MathJax 和已加载的 Prism 语法；不执行代码、HTML、嵌入或第三方代码块处理器。无法排版时保留文字，长行可横向滚动。可运行“预览 AI 栏公式与代码”。
+- **历史与归档**：支持服务提供的分页对话历史、归档与恢复；归档保留消息，关闭标签只隐藏标签。自动修改历史可继续加载更早批次，并按源笔记路径筛选。后台设置显示任务状态、错误与知识索引进度，刷新状态不会清空未保存输入。
 - **搜索与 DAG**：在授权 Vault 内搜索、按行阅读、核对来源，并根据明确段落生成 DAG。DAG 写入仍需审阅并确认。没有向量索引或语义搜索。
+
+Summary layouts follow the available reading-pane width. Narrow views retain a short preview, and expansion survives script and layout changes. History supports pagination and reversible archiving when offered by the service; closing a tab only hides it. Background status and errors refresh without discarding unsaved settings.
 
 Background automation produces whole-note and section summaries without changing the source file. Knowledge maintenance reuses existing pages first, creates new pages only when justified by the source, and adds contextual wiki links. It is opt-in and can write in the configured scope automatically. Review every batch and use version-checked undo; edited or referenced knowledge pages may be retained. Simplified/Traditional conversion changes rendering only. Formula and code rendering never executes notebook code or third-party Markdown processors.
 
@@ -43,11 +46,11 @@ Minimum Obsidian version: **1.11.4**. **iPadOS is a mobile release target; physi
 
 社区目录是否已收录、哪个版本可安装，以 [Obsidian 社区目录](https://community.obsidian.md/plugins) 实际显示为准。本说明与本地构建不代表审核已经通过。
 
-Before installing version **0.4.11**, verify that its matching [GitHub release](https://github.com/YuXHe15/helin-assistant/releases) exists. These instructions do not claim that this version has already been published or accepted into the community directory.
+Before installing version **0.4.12**, verify that its matching [GitHub release](https://github.com/YuXHe15/helin-assistant/releases) exists. These instructions do not claim that this version has already been published or accepted into the community directory.
 
 - **社区目录 / Community directory**：收录后，在 Obsidian 的第三方插件浏览中搜索 **Helin Assistant**，安装并启用。
 - **试用 / BRAT**：安装 [BRAT](https://github.com/TfTHacker/obsidian42-brat)，添加 `YuXHe15/helin-assistant`，选择已发布的目标版本，再启用 Helin Assistant。普通安装不需要 GitHub 令牌。
-- **桌面手动安装 / Desktop manual installation**：下载同版本 `helin-assistant-0.4.11.zip`，将其中的 `helin-assistant` 文件夹放到 Vault 的 `.obsidian/plugins/`。更新时替换发布文件，保留已有本机配置与配对。
+- **桌面手动安装 / Desktop manual installation**：下载同版本 `helin-assistant-0.4.12.zip`，将其中的 `helin-assistant` 文件夹放到 Vault 的 `.obsidian/plugins/`。更新时替换发布文件，保留已有本机配置与配对。
 
 安装目录内的运行文件是 `manifest.json`、`main.js` 和 `styles.css`。保留随包附带的 `LICENSE`、`COPYRIGHT.txt` 和 `THIRD_PARTY_NOTICES.txt`；许可证也附在 `main.js` 中，覆盖只下载运行文件的安装方式。不要复制他人的 `data.json` 或秘密存储。
 
