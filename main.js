@@ -8690,6 +8690,15 @@ function parsePolicy(value) {
     quiet_seconds: p2.quiet_seconds
   };
 }
+function parsePolicySnapshot(value) {
+  const snapshot = object2(value), policy = parsePolicy(snapshot.policy);
+  if (!policy || snapshot.managed_elsewhere !== void 0 && typeof snapshot.managed_elsewhere !== "boolean") return null;
+  const shared = snapshot.shared_policy == null ? null : parsePolicy(snapshot.shared_policy);
+  if (snapshot.shared_policy != null && !shared) return null;
+  const managed = snapshot.managed_elsewhere === true;
+  if (managed && !shared) return null;
+  return { policy, managed_elsewhere: managed, shared_policy: shared };
+}
 function parseSummary(value, expectedPath) {
   const result = object2(value);
   if (!["ready", "pending", "stale", "disabled"].includes(String(result.status))) return null;
@@ -8726,7 +8735,7 @@ function parseSummary(value, expectedPath) {
 }
 function parseBatch(value) {
   const b2 = object2(value);
-  if (typeof b2.id !== "string" || !ID2.test(b2.id) || !integer(b2.version ?? 1, 1, 1e6) || !text3(b2.status, 40) || !safeNotePath(b2.source_path) || !text3(b2.created_at, 80) || !Array.isArray(b2.concepts) || b2.concepts.length > 100) return null;
+  if (typeof b2.id !== "string" || !ID2.test(b2.id) || !integer(b2.version ?? 1, 1, 1e6) || !text3(b2.status, 40) || !safeNotePath(b2.source_path) || !text3(b2.created_at, 80) || !Array.isArray(b2.concepts) || b2.concepts.length > 100 || b2.can_undo !== void 0 && typeof b2.can_undo !== "boolean") return null;
   const concepts = [];
   for (const raw of b2.concepts) {
     const c = object2(raw);
@@ -8759,6 +8768,7 @@ function parseBatch(value) {
     created_at: b2.created_at,
     concepts,
     changes,
+    ...b2.can_undo === void 0 ? {} : { can_undo: b2.can_undo },
     ...text3(b2.error, 500) ? { error: b2.error } : {},
     ...retained.length ? { retained } : {}
   };
@@ -10122,7 +10132,7 @@ function localTime(value) {
   const date = new Date(value);
   return Number.isFinite(date.getTime()) ? date.toLocaleString() : null;
 }
-function renderAutomationStatus(parent, status2, enabled, connectionError = "", policyChanged = false) {
+function renderAutomationStatus(parent, status2, enabled, connectionError = "", policyChanged = false, managedElsewhere = false) {
   parent.empty();
   parent.setAttribute("role", "status");
   parent.setAttribute("aria-live", "polite");
@@ -10147,10 +10157,10 @@ function renderAutomationStatus(parent, status2, enabled, connectionError = "", 
     const retry = new Date(status2.next_retry_at * 1e3);
     if (Number.isFinite(retry.getTime())) parent.createEl("p", { text: `\u4E0B\u6B21\u540E\u53F0\u68C0\u67E5\uFF1A${retry.toLocaleString()}`, cls: "va-muted" });
   }
-  if (error2 || count(status2.failed)) parent.createEl("p", { text: "\u53EF\u70B9\u51FB\u201C\u68C0\u67E5\u5DF2\u4FDD\u5B58\u7B14\u8BB0\u201D\u91CD\u8BD5\uFF1B\u82E5\u4ECD\u672A\u5B8C\u6210\uFF0C\u8BF7\u68C0\u67E5\u52A9\u624B\u8FDE\u63A5\u6216\u8C03\u6574\u6E90\u7B14\u8BB0\u8303\u56F4\u3002", cls: "va-muted" });
+  if (error2 || count(status2.failed)) parent.createEl("p", { text: managedElsewhere ? "\u8BF7\u7531\u8FD0\u884C\u540E\u53F0\u6574\u7406\u7684\u6210\u5458\u68C0\u67E5\u52A9\u624B\u8FDE\u63A5\u5E76\u91CD\u8BD5\uFF1B\u4F60\u53EF\u4EE5\u7EE7\u7EED\u67E5\u770B\u5171\u4EAB\u72B6\u6001\u4E0E\u53D8\u66F4\u5386\u53F2\u3002" : "\u53EF\u70B9\u51FB\u201C\u68C0\u67E5\u5DF2\u4FDD\u5B58\u7B14\u8BB0\u201D\u91CD\u8BD5\uFF1B\u82E5\u4ECD\u672A\u5B8C\u6210\uFF0C\u8BF7\u68C0\u67E5\u52A9\u624B\u8FDE\u63A5\u6216\u8C03\u6574\u6E90\u7B14\u8BB0\u8303\u56F4\u3002", cls: "va-muted" });
   if (status2.scanning || status2.scanning_partial) parent.createEl("p", { text: "\u6B63\u5728\u5206\u6279\u53D1\u73B0\u7B14\u8BB0\uFF0C\u5C1A\u672A\u626B\u63CF\u7684\u7B14\u8BB0\u4F1A\u5728\u540E\u7EED\u68C0\u67E5\u4E2D\u7EE7\u7EED\u5904\u7406\u3002", cls: "va-muted" });
   if (connectionError) parent.createEl("p", { text: `\u72B6\u6001\u66F4\u65B0\u672A\u5B8C\u6210\uFF1A${connectionError} \u5C06\u81EA\u52A8\u91CD\u8BD5\uFF0C\u4E5F\u53EF\u70B9\u51FB\u201C\u5237\u65B0\u540E\u53F0\u72B6\u6001\u201D\u3002`, cls: "va-error" });
-  if (policyChanged) parent.createEl("p", { text: "\u5176\u4ED6\u8BBE\u5907\u5DF2\u66F4\u65B0\u8BBE\u7F6E\u3002\u4F60\u7684\u672A\u4FDD\u5B58\u8F93\u5165\u5DF2\u4FDD\u7559\uFF1B\u4FDD\u5B58\u524D\u8BF7\u91CD\u65B0\u52A0\u8F7D\u8BBE\u7F6E\u3002", cls: "va-error" });
+  if (policyChanged) parent.createEl("p", { text: managedElsewhere ? "\u5171\u4EAB\u540E\u53F0\u7B56\u7565\u5DF2\u66F4\u65B0\uFF1B\u8BF7\u91CD\u65B0\u52A0\u8F7D\u8BBE\u7F6E\u67E5\u770B\u6700\u65B0\u8303\u56F4\u3002" : "\u5176\u4ED6\u8BBE\u5907\u5DF2\u66F4\u65B0\u8BBE\u7F6E\u3002\u4F60\u7684\u672A\u4FDD\u5B58\u8F93\u5165\u5DF2\u4FDD\u7559\uFF1B\u4FDD\u5B58\u524D\u8BF7\u91CD\u65B0\u52A0\u8F7D\u8BBE\u7F6E\u3002", cls: "va-error" });
 }
 var AutomationSettingsModal = class extends import_obsidian4.Modal {
   constructor(app, controller, changed) {
@@ -10166,6 +10176,16 @@ var AutomationSettingsModal = class extends import_obsidian4.Modal {
     this.policy = null;
     this.policyChanged = false;
     this.statusRequest = 0;
+    this.managedElsewhere = false;
+    this.latestManagedElsewhere = false;
+    this.managementChanged = false;
+    this.sharedPolicy = null;
+    this.managementEl = null;
+    this.saveButton = null;
+    this.scanButton = null;
+    this.saving = false;
+    this.scanning = false;
+    this.policyControls = [];
     this.bindingScope = controller.sessionKey();
   }
   current() {
@@ -10184,6 +10204,25 @@ var AutomationSettingsModal = class extends import_obsidian4.Modal {
       }
     });
     void this.load();
+  }
+  managementLocked() {
+    return this.managedElsewhere || this.managementChanged;
+  }
+  policyControl(control2, disabled = () => false) {
+    this.policyControls.push({ control: control2, disabled });
+    return control2;
+  }
+  updateManagementControls() {
+    for (const item of this.policyControls) item.control.setDisabled(this.managementLocked() || item.disabled());
+    if (this.saveButton) this.saveButton.disabled = this.managementLocked() || this.saving;
+    if (this.scanButton) this.scanButton.disabled = this.managementLocked() || this.scanning;
+    if (!this.managementEl) return;
+    this.managementEl.empty();
+    if (this.latestManagedElsewhere) this.managementEl.createEl("p", { text: "\u6B64\u77E5\u8BC6\u5E93\u7531\u53E6\u4E00\u6210\u5458\u8FD0\u884C\u540E\u53F0\u6574\u7406\uFF1B\u6458\u8981\u4E0E\u77E5\u8BC6\u53D8\u66F4\u5728\u6709\u6743\u9650\u7684\u7AEF\u5171\u4EAB\u3002\u5F53\u524D\u5171\u4EAB\u7B56\u7565\u53EA\u8BFB\uFF0C\u53EF\u67E5\u770B\u72B6\u6001\u4E0E\u53D8\u66F4\u5386\u53F2\u3002", cls: "va-muted" });
+    if (this.managementChanged) this.managementEl.createEl("p", { text: "\u540E\u53F0\u7BA1\u7406\u89D2\u8272\u5DF2\u53D8\u5316\u6216\u9700\u8981\u91CD\u65B0\u786E\u8BA4\u3002\u539F\u6709\u672A\u4FDD\u5B58\u8F93\u5165\u5DF2\u4FDD\u7559\uFF1B\u8BF7\u91CD\u65B0\u52A0\u8F7D\u8BBE\u7F6E\u540E\u518D\u64CD\u4F5C\u3002", cls: "va-error" });
+  }
+  statusEnabled() {
+    return (this.managedElsewhere ? this.sharedPolicy : this.policy)?.enabled ?? false;
   }
   cancelPoll() {
     if (this.poll) clearTimeout(this.poll);
@@ -10204,14 +10243,22 @@ var AutomationSettingsModal = class extends import_obsidian4.Modal {
     try {
       const response = record2(await this.controller.requestAutomation("/policy", "GET", void 0, void 0, true));
       if (!this.current() || request !== this.statusRequest || revision !== this.revision || !this.statusEl || !this.policy) return;
-      const policy = parsePolicy(response.policy);
-      if (!policy) throw new Error("invalid policy");
+      const snapshot = parsePolicySnapshot(response);
+      if (!snapshot) {
+        this.managementChanged = true;
+        this.updateManagementControls();
+        throw new Error("invalid policy");
+      }
+      this.managementChanged || (this.managementChanged = snapshot.managed_elsewhere !== this.managedElsewhere);
+      this.latestManagedElsewhere = snapshot.managed_elsewhere;
       this.status = record2(response.status);
-      this.policyChanged = policy.version !== this.policy.version;
-      renderAutomationStatus(this.statusEl, this.status, policy.enabled, "", this.policyChanged);
+      this.policyChanged = snapshot.policy.version !== this.policy.version || this.managedElsewhere && JSON.stringify(snapshot.shared_policy) !== JSON.stringify(this.sharedPolicy);
+      this.updateManagementControls();
+      const visible = snapshot.managed_elsewhere ? snapshot.shared_policy : snapshot.policy;
+      renderAutomationStatus(this.statusEl, this.status, visible.enabled, "", this.policyChanged, snapshot.managed_elsewhere);
     } catch (error2) {
       if (this.current() && request === this.statusRequest && revision === this.revision && this.statusEl && this.policy)
-        renderAutomationStatus(this.statusEl, this.status, this.policy.enabled, errorText(error2), this.policyChanged);
+        renderAutomationStatus(this.statusEl, this.status, this.statusEnabled(), errorText(error2), this.policyChanged, this.latestManagedElsewhere);
     } finally {
       if (this.current() && request === this.statusRequest && revision === this.revision) this.schedulePoll();
     }
@@ -10223,9 +10270,9 @@ var AutomationSettingsModal = class extends import_obsidian4.Modal {
     try {
       const response = record2(await this.controller.requestAutomation("/policy"));
       if (!this.current() || revision !== this.revision) return;
-      const policy = parsePolicy(response.policy);
-      if (!policy) throw new Error("invalid policy");
-      this.render(policy, record2(response.status));
+      const snapshot = parsePolicySnapshot(response);
+      if (!snapshot) throw new Error("invalid policy");
+      this.render(snapshot, record2(response.status));
     } catch (error2) {
       if (this.current() && revision === this.revision) {
         this.contentEl.setText(errorText(error2));
@@ -10236,28 +10283,36 @@ var AutomationSettingsModal = class extends import_obsidian4.Modal {
       }
     }
   }
-  render(policy, status2 = {}) {
+  render(snapshot, status2 = {}) {
+    const policy = snapshot.managed_elsewhere ? snapshot.shared_policy : snapshot.policy;
     this.cancelPoll();
     this.revision++;
-    this.policy = policy;
+    this.policy = snapshot.policy;
+    this.sharedPolicy = snapshot.shared_policy;
+    this.managedElsewhere = this.latestManagedElsewhere = snapshot.managed_elsewhere;
+    this.managementChanged = false;
     this.status = status2;
     this.policyChanged = false;
+    this.saving = false;
+    this.scanning = false;
+    this.policyControls = [];
     this.contentEl.empty();
     this.contentEl.createEl("p", { text: "\u540E\u53F0\u5728\u7B14\u8BB0\u4FDD\u5B58\u5E76\u7A33\u5B9A\u540E\uFF0C\u63D0\u70BC\u503C\u5F97\u72EC\u7ACB\u9605\u8BFB\u7684\u4E3B\u9898\uFF0C\u8FDE\u63A5\u5DF2\u6709\u7B14\u8BB0\uFF0C\u5E76\u5728\u9700\u8981\u65F6\u8865\u5145\u77E5\u8BC6\u9875\u3002\u65B0\u77E5\u8BC6\u9875\u6CE8\u660E\u6765\u6E90\uFF0C\u539F\u59CB\u7B14\u8BB0\u4E0E\u76F8\u5173\u77E5\u8BC6\u901A\u8FC7\u94FE\u63A5\u76F8\u8FDE\u3002\u6458\u8981\u53EA\u663E\u793A\u5728\u539F\u6587\u65C1\uFF0C\u81EA\u52A8\u4FEE\u6539\u53EF\u67E5\u770B\u6216\u64A4\u9500\u3002", cls: "va-muted" });
+    this.managementEl = this.contentEl.createDiv();
     const draft = { ...policy };
     let placement = draft.concept_prefix ? "folder" : "same_directory";
-    new import_obsidian4.Setting(this.contentEl).setName("\u542F\u7528\u540E\u53F0\u5904\u7406").addToggle((toggle) => toggle.setValue(draft.enabled).onChange((value) => {
+    new import_obsidian4.Setting(this.contentEl).setName("\u542F\u7528\u540E\u53F0\u5904\u7406").addToggle((toggle) => this.policyControl(toggle).setValue(draft.enabled).onChange((value) => {
       draft.enabled = value;
     }));
-    new import_obsidian4.Setting(this.contentEl).setName("\u751F\u6210\u5168\u6587\u548C\u7AE0\u8282\u6458\u8981").addToggle((toggle) => toggle.setValue(draft.summaries_enabled).onChange((value) => {
+    new import_obsidian4.Setting(this.contentEl).setName("\u751F\u6210\u5168\u6587\u548C\u7AE0\u8282\u6458\u8981").addToggle((toggle) => this.policyControl(toggle).setValue(draft.summaries_enabled).onChange((value) => {
       draft.summaries_enabled = value;
     }));
     new import_obsidian4.Setting(this.contentEl).setName("\u81EA\u52A8\u7EF4\u62A4\u77E5\u8BC6\u9875\u4E0E\u5173\u8054").setDesc("\u4F18\u5148\u8FDE\u63A5\u5DF2\u6709\u7B14\u8BB0\uFF1B\u65B0\u77E5\u8BC6\u9875\u4FDD\u7559\u539F\u6587\u6765\u6E90\u3002\u542F\u7528\u540E\u81EA\u52A8\u5199\u5165\uFF0C\u53EF\u67E5\u770B\u5DEE\u5F02\u4E0E\u64A4\u9500\u3002").addToggle((toggle) => {
-      toggle.setValue(draft.concepts_enabled).setDisabled(!!this.controller.state.account?.read_only).onChange((value) => {
+      this.policyControl(toggle, () => !!this.controller.state.account?.read_only).setValue(draft.concepts_enabled).onChange((value) => {
         draft.concepts_enabled = value;
       });
     });
-    new import_obsidian4.Setting(this.contentEl).setName("\u6E90\u7B14\u8BB0\u76EE\u5F55").setDesc("\u76F8\u5BF9 Vault \u7684\u76EE\u5F55\uFF1B\u7559\u7A7A\u8868\u793A\u670D\u52A1\u5141\u8BB8\u7684\u5168\u90E8\u7B14\u8BB0\u3002").addText((input) => input.setPlaceholder("\u9879\u76EE/ \u6216\u7559\u7A7A").setValue(draft.source_prefix).onChange((value) => {
+    new import_obsidian4.Setting(this.contentEl).setName("\u6E90\u7B14\u8BB0\u76EE\u5F55").setDesc("\u76F8\u5BF9 Vault \u7684\u76EE\u5F55\uFF1B\u7559\u7A7A\u8868\u793A\u670D\u52A1\u5141\u8BB8\u7684\u5168\u90E8\u7B14\u8BB0\u3002").addText((input) => this.policyControl(input).setPlaceholder("\u9879\u76EE/ \u6216\u7559\u7A7A").setValue(draft.source_prefix).onChange((value) => {
       draft.source_prefix = value;
     }));
     let folderSetting;
@@ -10266,17 +10321,17 @@ var AutomationSettingsModal = class extends import_obsidian4.Modal {
       folderSetting.settingEl.hidden = placement !== "folder";
       folderSetting.settingEl.style.display = placement === "folder" ? "" : "none";
     };
-    new import_obsidian4.Setting(this.contentEl).setName("\u77E5\u8BC6\u9875\u4F4D\u7F6E").addDropdown((dropdown) => dropdown.addOption("same_directory", "\u4E0E\u539F\u7B14\u8BB0\u540C\u76EE\u5F55\uFF08\u63A8\u8350\uFF09").addOption("folder", "\u6307\u5B9A\u76EE\u5F55").setValue(placement).onChange((value) => {
+    new import_obsidian4.Setting(this.contentEl).setName("\u77E5\u8BC6\u9875\u4F4D\u7F6E").addDropdown((dropdown) => this.policyControl(dropdown).addOption("same_directory", "\u4E0E\u539F\u7B14\u8BB0\u540C\u76EE\u5F55\uFF08\u63A8\u8350\uFF09").addOption("folder", "\u6307\u5B9A\u76EE\u5F55").setValue(placement).onChange((value) => {
       placement = value;
       updateFolder();
     }));
-    folderSetting = new import_obsidian4.Setting(this.contentEl).setName("\u6307\u5B9A\u76EE\u5F55").setDesc("\u65B0\u77E5\u8BC6\u9875\u4FDD\u5B58\u5230\u8FD9\u91CC\u3002").addText((input) => input.setPlaceholder("\u9009\u62E9\u7B14\u8BB0\u76EE\u5F55").setValue(draft.concept_prefix).onChange((value) => {
+    folderSetting = new import_obsidian4.Setting(this.contentEl).setName("\u6307\u5B9A\u76EE\u5F55").setDesc("\u65B0\u77E5\u8BC6\u9875\u4FDD\u5B58\u5230\u8FD9\u91CC\u3002").addText((input) => this.policyControl(input).setPlaceholder("\u9009\u62E9\u7B14\u8BB0\u76EE\u5F55").setValue(draft.concept_prefix).onChange((value) => {
       draft.concept_prefix = value;
     }));
     updateFolder();
     this.contentEl.createEl("p", { text: `\u4FDD\u5B58\u540E\u9759\u7F6E\u7EA6 ${policy.quiet_seconds} \u79D2\u8FDB\u5165\u4F4E\u4F18\u5148\u961F\u5217\u3002\u524D\u53F0\u63D0\u95EE\u4F18\u5148\u3002`, cls: "va-muted" });
     this.statusEl = this.contentEl.createDiv({ cls: "va-automation-status" });
-    renderAutomationStatus(this.statusEl, status2, policy.enabled);
+    renderAutomationStatus(this.statusEl, status2, policy.enabled, "", false, this.managedElsewhere);
     const error2 = this.contentEl.createEl("p", { cls: "va-error", attr: { role: "alert" } });
     error2.hidden = true;
     const actions = this.contentEl.createDiv({ cls: "va-automation-actions" });
@@ -10293,9 +10348,11 @@ var AutomationSettingsModal = class extends import_obsidian4.Modal {
       if (this.current()) void this.load();
     };
     const scan = actions.createEl("button", { text: "\u68C0\u67E5\u5DF2\u4FDD\u5B58\u7B14\u8BB0", type: "button" });
+    this.scanButton = scan;
     scan.onclick = () => {
-      if (!this.current() || scan.disabled) return;
-      scan.disabled = true;
+      if (!this.current() || this.managementLocked() || scan.disabled) return;
+      this.scanning = true;
+      this.updateManagementControls();
       error2.hidden = true;
       void this.controller.requestAutomation("/scan", "POST", {}).then(() => {
         if (this.current()) {
@@ -10310,12 +10367,16 @@ var AutomationSettingsModal = class extends import_obsidian4.Modal {
           error2.hidden = false;
         }
       }).finally(() => {
-        if (this.current()) scan.disabled = false;
+        if (this.current()) {
+          this.scanning = false;
+          this.updateManagementControls();
+        }
       });
     };
     const save = actions.createEl("button", { text: "\u4FDD\u5B58\u8BBE\u7F6E", type: "button", cls: "mod-cta" });
+    this.saveButton = save;
     save.onclick = () => {
-      if (!this.current() || save.disabled) return;
+      if (!this.current() || this.managementLocked() || save.disabled) return;
       if (this.policyChanged) {
         error2.textContent = "\u8BBE\u7F6E\u5DF2\u88AB\u5176\u4ED6\u8BBE\u5907\u66F4\u65B0\uFF0C\u8BF7\u91CD\u65B0\u52A0\u8F7D\u8BBE\u7F6E\u540E\u4FDD\u5B58\u3002\u4F60\u7684\u8F93\u5165\u4ECD\u4FDD\u7559\u5728\u6B64\u5904\u3002";
         error2.hidden = false;
@@ -10340,12 +10401,13 @@ var AutomationSettingsModal = class extends import_obsidian4.Modal {
         this.schedulePoll();
         return;
       }
-      save.disabled = true;
+      this.saving = true;
+      this.updateManagementControls();
       reload.disabled = true;
       error2.hidden = true;
       void this.controller.requestAutomation("/policy", "POST", next).then((response) => {
         if (!this.current() || revision !== this.revision) return;
-        const updated = parsePolicy(record2(response).policy);
+        const updated = parsePolicySnapshot(response);
         if (!updated) throw new Error("invalid policy");
         this.changed();
         this.render(updated, record2(record2(response).status));
@@ -10356,12 +10418,14 @@ var AutomationSettingsModal = class extends import_obsidian4.Modal {
         }
       }).finally(() => {
         if (this.current()) {
-          save.disabled = false;
+          this.saving = false;
+          this.updateManagementControls();
           reload.disabled = false;
           this.schedulePoll();
         }
       });
     };
+    this.updateManagementControls();
     this.schedulePoll();
   }
   onClose() {
@@ -10371,6 +10435,10 @@ var AutomationSettingsModal = class extends import_obsidian4.Modal {
     this.stop?.();
     this.stop = null;
     this.statusEl = null;
+    this.managementEl = null;
+    this.saveButton = null;
+    this.scanButton = null;
+    this.policyControls = [];
     this.contentEl.empty();
   }
 };
@@ -10588,6 +10656,7 @@ var AutomationHistoryModal = class extends import_obsidian4.Modal {
     }
     const error2 = this.contentEl.createEl("p", { cls: "va-error", attr: { role: "alert" } });
     error2.hidden = true;
+    if (batch.can_undo === false) this.contentEl.createEl("p", { text: "\u6B64\u6279\u6B21\u7531\u53D1\u8D77\u8D26\u53F7\u64A4\u9500\uFF1B\u4F60\u53EF\u4EE5\u67E5\u770B\u5DEE\u5F02\u4E0E\u4FEE\u6539\u524D\u540E\u5168\u6587\u3002", cls: "va-muted" });
     if (["undo_queued", "undoing", "applying"].includes(batch.status)) {
       this.contentEl.createEl("p", { text: "\u540E\u53F0\u6B63\u5728\u5904\u7406\uFF0C\u6B64\u5904\u4F1A\u81EA\u52A8\u5237\u65B0\u7ED3\u679C\u3002", cls: "va-muted" });
       this.poll = setTimeout(() => {
@@ -10596,11 +10665,12 @@ var AutomationHistoryModal = class extends import_obsidian4.Modal {
       }, 3e3);
       return;
     }
+    if (batch.can_undo === false) return;
     if (!["applied", "needs_attention", "undo_failed", "partial_undo"].includes(batch.status)) return;
     const undo = this.contentEl.createEl("button", { text: "\u64A4\u9500\u6B64\u6279\u6B21", type: "button" });
     undo.disabled = !!this.controller.state.account?.read_only;
     undo.onclick = () => {
-      if (!this.current(revision) || undo.disabled) return;
+      if (!this.current(revision) || batch.can_undo === false || this.controller.state.account?.read_only || undo.disabled) return;
       undo.disabled = true;
       back.disabled = true;
       error2.hidden = true;
